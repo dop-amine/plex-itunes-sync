@@ -1,0 +1,17 @@
+plex:
+  url: "http://192.168.1.69:32400"
+  token: "YOUR_PLEX_TOKEN"
+  library: "Music"
+
+path_mapping:
+  itunes_prefix: "file://localhost/D:/Music/iTunes/iTunes Media/Music/"
+  plex_prefix: "/media/music/"
+
+itunes:
+  library_xml: "D:\\Music\\iTunes\\iTunes Library.xml"
+
+sync:
+  # Maps iTunes playlist name -> Plex collection name
+  # Albums can appear in multiple collections
+  playlists:
+    "iTunes Playlist Name": "Plex Collection Name"

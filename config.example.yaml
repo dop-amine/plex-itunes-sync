@@ -11,7 +11,10 @@ itunes:
   library_xml: "D:\\Music\\iTunes\\iTunes Library.xml"
 
 sync:
-  # Maps iTunes playlist name -> Plex collection name
-  # Albums can appear in multiple collections
+  # Album-level: iTunes playlist -> Plex Collection
   playlists:
     "iTunes Playlist Name": "Plex Collection Name"
+
+  # Track-level: iTunes playlist -> Plex Playlist (preserves order)
+  track_playlists:
+    "iTunes Playlist Name": "Plex Playlist Name"

@@ -1,8 +1,8 @@
-# iTunes Playlist to Plex Collection Sync
+# iTunes to Plex Sync
 
-Syncs iTunes playlists (used as album groupings) to Plex Collections. Reads your `iTunes Library.xml`, extracts albums from specified playlists, finds the matching albums in Plex, and creates or updates Plex Collections.
+Syncs iTunes playlists to Plex **Collections** (album-level) and/or Plex **Playlists** (track-level, preserving order). Reads your `iTunes Library.xml`, finds the matching content in Plex, and creates or updates the targets.
 
-**Non-destructive**: only reads the XML file and manages Plex collection metadata. Music files are never touched.
+**Non-destructive**: only reads the XML file and manages Plex collection/playlist metadata. Music files are never touched.
 
 Tested with iTunes 12.4.0.119 on Windows and Plex Media Server on Ubuntu Linux.
 
@@ -30,10 +30,18 @@ itunes:
   library_xml: "D:\\Music\\iTunes\\iTunes Library.xml"
 
 sync:
+  # Album-level: iTunes playlist -> Plex Collection
   playlists:
     "Dub Sessions": "Dub Sessions"
-    # Add more mappings: "iTunes Playlist Name": "Plex Collection Name"
+    # Add more: "iTunes Playlist Name": "Plex Collection Name"
+
+  # Track-level: iTunes playlist -> Plex Playlist (preserves order)
+  track_playlists:
+    "My iTunes Playlist": "My Plex Playlist"
 ```
+
+- **`sync.playlists`** maps an iTunes playlist to a Plex **Collection**. Albums are deduplicated from the playlist's tracks.
+- **`sync.track_playlists`** maps an iTunes playlist to a Plex **Playlist**. Individual tracks are matched and their order is preserved.
 
 ### Finding your Plex token
 
@@ -75,12 +83,20 @@ python sync.py --no-remove
 
 ## How It Works
 
+### Collection sync (`sync.playlists`)
 1. Parses `iTunes Library.xml` with Python's `plistlib`
 2. Finds each configured playlist and extracts track references
 3. Groups tracks by (Album Artist, Album Name) to get unique albums
 4. Connects to Plex and searches for each album
 5. Creates the collection if it doesn't exist, or updates it (adds missing albums, removes stale ones)
 6. Reports matched and unmatched albums
+
+### Playlist sync (`sync.track_playlists`)
+1. Parses `iTunes Library.xml` the same way
+2. Extracts the ordered list of individual tracks from each playlist
+3. Matches each track to a Plex track by (Artist, Album, Title), falling back to case-insensitive and path-based matching
+4. Creates the Plex playlist if it doesn't exist, or updates it (adds missing tracks, removes stale ones, reorders to match iTunes)
+5. Reports matched and unmatched tracks
 
 ---
 
@@ -107,11 +123,12 @@ python sync.py --no-remove
 │        │               │            │
 │  Plex Media Server ◄───┘            │
 │    └─ Music Library                 │
-│         └─ Collections (created)    │
+│         ├─ Collections (created)    │
+│         └─ Playlists (created)      │
 └─────────────────────────────────────┘
 ```
 
-The script runs entirely on the Windows side. It reads the local iTunes XML file and talks to Plex over HTTP. Music files on the Plex server are never touched -- only collection metadata is written through the Plex API.
+The script runs entirely on the Windows side. It reads the local iTunes XML file and talks to Plex over HTTP. Music files on the Plex server are never touched -- only collection and playlist metadata is written through the Plex API.
 
 ### iTunes Library.xml Structure
 
@@ -149,6 +166,20 @@ Instead, the script fetches **every album** in the Plex music library in a singl
 
 All subsequent lookups are O(1) dictionary hits. If all four tiers miss, the script falls back to a targeted Plex API search (Plex's own search is accent-insensitive), and finally to file path matching as a last resort.
 
+### Plex Track Index
+
+For track-level playlist sync, the same bulk-fetch strategy is used, but for **tracks** instead of albums. This means fetching every track in the library (`/library/sections/{id}/allLeaves`), which can be 100K+ tracks for a large library. The index is only built when `track_playlists` is configured.
+
+Four matching tiers are used:
+
+| Tier | Key | Catches |
+|------|-----|---------|
+| 1 | `(NFC(artist), NFC(album), NFC(title))` | Exact match with full metadata |
+| 2 | `(NFC(artist), NFC(title))` | Album name differs between sources |
+| 3 | Case-insensitive versions of tier 1 | Case differences |
+| 4 | Case-insensitive versions of tier 2 | Loosest in-memory match |
+| 5 | File path match | Last resort using translated file paths |
+
 ### Cross-Platform Unicode Normalization
 
 This is where things get subtle. iTunes has macOS heritage and stores metadata strings in [NFD (decomposed)](https://unicode.org/reports/tr15/) form: an accented character like `O` is stored as two code points (`O` + combining acute accent). Linux filesystems and Plex typically use NFC (composed) form, where `O` is a single precomposed code point.
@@ -177,6 +208,17 @@ The sync operation is designed to be safely re-runnable:
 
 This means running the script twice in a row is a no-op on the second run. Albums can belong to multiple collections, and the script never interferes with collections it isn't managing.
 
+### Playlist Sync (Idempotent, Order-Preserving)
+
+Track-level playlist sync follows the same idempotent pattern:
+
+1. If the playlist **doesn't exist**, create it with all matched tracks in iTunes order.
+2. If it **already exists**, compute the diff:
+   - Tracks in Plex playlist but not in iTunes → remove (unless `--no-remove`)
+   - Tracks in iTunes but not in Plex playlist → add
+   - If all tracks match but **order** differs → reorder to match iTunes
+3. Plex's `moveItem()` API is used to reorder tracks into the correct sequence without removing and re-adding them.
+
 ### Safety Model
 
 The script is intentionally limited in what it can do:
@@ -185,14 +227,16 @@ The script is intentionally limited in what it can do:
 |-----------|---------|-------|
 | Read `iTunes Library.xml` | Yes | Read-only, never writes |
 | Read/write pickle cache | Yes | Local to the script directory |
-| Read Plex album metadata | Yes | Via `python-plexapi` over HTTP |
+| Read Plex album/track metadata | Yes | Via `python-plexapi` over HTTP |
 | Create Plex collections | Yes | Additive metadata only |
+| Create Plex playlists | Yes | Additive metadata only |
 | Add/remove albums from collections | Yes | Metadata tags, not file operations |
+| Add/remove/reorder tracks in playlists | Yes | Playlist metadata, not file operations |
 | Modify music files | **No** | No file I/O to the music directory |
-| Delete Plex collections | **No** | Only creates or updates |
-| Modify Plex library settings | **No** | Only collection-level operations |
+| Delete Plex collections or playlists | **No** | Only creates or updates |
+| Modify Plex library settings | **No** | Only collection/playlist-level operations |
 
-Deleting a Plex collection does not affect the underlying albums or tracks in any way -- collections are purely organizational metadata.
+Deleting a Plex collection or playlist does not affect the underlying albums or tracks in any way -- they are purely organizational metadata.
 
 ### Dependencies
 

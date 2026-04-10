@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sync iTunes playlists to Plex Collections and/or Plex Playlists."""
+"""Sync iTunes playlists to Plex Collections, Playlists, and album labels."""
 
 from __future__ import annotations
 
@@ -94,6 +94,18 @@ class PlaylistSyncResult:
     added: int = 0
     removed: int = 0
     already_present: int = 0
+
+
+@dataclass
+class LabelSyncResult:
+    """Accumulates per-label sync outcomes for reporting."""
+    label_name: str
+    itunes_albums: int = 0
+    matched: int = 0
+    unmatched: list[AlbumKey] = field(default_factory=list)
+    updated: int = 0
+    already_set: int = 0
+    conflicts: list[tuple[AlbumKey, str, str]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -933,12 +945,90 @@ def _reorder_playlist(plex: PlexServer, playlist_name: str, desired_tracks: list
 
 
 # ---------------------------------------------------------------------------
+# Label (studio) metadata sync
+# ---------------------------------------------------------------------------
+
+def sync_label(
+    music_section,
+    label_name: str,
+    albums: list[AlbumKey],
+    path_map: dict[AlbumKey, list[str]],
+    album_index: PlexAlbumIndex,
+    seen_albums: dict[int, str],
+    *,
+    dry_run: bool = False,
+) -> LabelSyncResult:
+    """Set the studio field on matched Plex albums to the given label.
+
+    ``seen_albums`` tracks ratingKey -> first assigned label across all label
+    playlists to detect multi-label conflicts (first label wins).
+    """
+    result = LabelSyncResult(label_name=label_name, itunes_albums=len(albums))
+
+    for ak in albums:
+        plex_album = album_index.find_with_fallback(
+            music_section, ak, plex_paths=path_map.get(ak)
+        )
+        if not plex_album:
+            result.unmatched.append(ak)
+            log.warning("UNMATCHED (label): %s", ak)
+            continue
+
+        result.matched += 1
+        rk = plex_album.ratingKey
+
+        if rk in seen_albums:
+            prev_label = seen_albums[rk]
+            if prev_label != label_name:
+                result.conflicts.append((ak, prev_label, label_name))
+                log.warning(
+                    "CONFLICT: %s already assigned to '%s', skipping '%s'",
+                    ak, prev_label, label_name,
+                )
+            continue
+
+        seen_albums[rk] = label_name
+        current_studio = getattr(plex_album, "studio", None) or ""
+
+        if _norm(current_studio) == _norm(label_name):
+            result.already_set += 1
+            log.debug("Already set: %s -> '%s'", ak, label_name)
+            continue
+
+        if dry_run:
+            result.updated += 1
+            if current_studio:
+                log.info(
+                    "[DRY RUN] Would change studio '%s' -> '%s' on %s",
+                    current_studio, label_name, ak,
+                )
+            else:
+                log.info(
+                    "[DRY RUN] Would set studio '%s' on %s",
+                    label_name, ak,
+                )
+        else:
+            plex_album.editStudio(label_name, locked=True)
+            result.updated += 1
+            if current_studio:
+                log.info(
+                    "Changed studio '%s' -> '%s' on %s",
+                    current_studio, label_name, ak,
+                )
+            else:
+                log.info("Set studio '%s' on %s", label_name, ak)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
 
 def print_report(
     collection_results: list[SyncResult],
     playlist_results: list[PlaylistSyncResult] | None = None,
+    label_results: list[LabelSyncResult] | None = None,
 ) -> None:
     """Print a summary of all sync operations."""
     print("\n" + "=" * 60)
@@ -983,6 +1073,31 @@ def print_report(
                     print(f"    - {tk}")
                 if len(r.unmatched_tracks) > 20:
                     print(f"    ... and {len(r.unmatched_tracks) - 20} more")
+
+    if label_results:
+        print("\n--- Labels ---")
+        all_conflicts: list[tuple[AlbumKey, str, str]] = []
+        for r in label_results:
+            print(f"\n  Label: {r.label_name}")
+            print(f"  iTunes albums:   {r.itunes_albums}")
+            print(f"  Matched in Plex: {r.matched}")
+            print(f"  Unmatched:       {len(r.unmatched)}")
+            print(f"  Updated:         {r.updated}")
+            print(f"  Already set:     {r.already_set}")
+            if r.conflicts:
+                print(f"  Conflicts:       {len(r.conflicts)}")
+
+            if r.unmatched:
+                print("\n  Unmatched albums:")
+                for ak in r.unmatched:
+                    print(f"    - {ak}")
+
+            all_conflicts.extend(r.conflicts)
+
+        if all_conflicts:
+            print("\n  Multi-label conflicts (first label wins):")
+            for ak, first_label, second_label in all_conflicts:
+                print(f"    - {ak}  (kept '{first_label}', skipped '{second_label}')")
 
     print("\n" + "=" * 60)
 
@@ -1053,13 +1168,14 @@ def main() -> None:
     plex_prefix = cfg["path_mapping"]["plex_prefix"]
     playlist_map: dict[str, str] = cfg["sync"].get("playlists", {}) or {}
     track_playlist_map: dict[str, str] = cfg["sync"].get("track_playlists", {}) or {}
+    label_map: dict[str, str] = cfg["sync"].get("labels", {}) or {}
 
     if plex_token == "YOUR_PLEX_TOKEN":
         log.error("Please set your Plex token in config.yaml")
         sys.exit(1)
 
-    if not playlist_map and not track_playlist_map:
-        log.error("No playlists or track_playlists configured in sync section")
+    if not playlist_map and not track_playlist_map and not label_map:
+        log.error("No playlists, track_playlists, or labels configured in sync section")
         sys.exit(1)
 
     # Parse iTunes library
@@ -1069,11 +1185,15 @@ def main() -> None:
     plex = connect_plex(plex_url, plex_token)
     music = plex.library.section(library_name)
 
+    # Build album index if needed by collections or labels
+    album_index: PlexAlbumIndex | None = None
+    if playlist_map or label_map:
+        album_index = PlexAlbumIndex(music)
+
     # --- Collection sync ---
     collection_results: list[SyncResult] = []
 
     if playlist_map:
-        album_index = PlexAlbumIndex(music)
         collection_index = PlexCollectionIndex(music)
 
         for itunes_playlist, collection_name in playlist_map.items():
@@ -1136,20 +1256,65 @@ def main() -> None:
             )
             playlist_results.append(pr)
 
+    # --- Label (studio metadata) sync ---
+    label_results: list[LabelSyncResult] = []
+
+    if label_map:
+        assert album_index is not None
+        seen_albums: dict[int, str] = {}
+
+        for itunes_playlist, label_name in label_map.items():
+            log.info(
+                "Syncing playlist '%s' -> label '%s'",
+                itunes_playlist, label_name,
+            )
+
+            albums = extract_playlist_albums(library, itunes_playlist)
+            if not albums:
+                log.warning("No albums found for playlist '%s'", itunes_playlist)
+                continue
+
+            path_map = extract_playlist_track_paths(
+                library, itunes_playlist, itunes_prefix, plex_prefix
+            )
+
+            lr = sync_label(
+                music,
+                label_name,
+                albums,
+                path_map,
+                album_index,
+                seen_albums,
+                dry_run=args.dry_run,
+            )
+            label_results.append(lr)
+
     # --- Report ---
-    print_report(collection_results, playlist_results)
+    print_report(collection_results, playlist_results, label_results)
 
     unmatched_albums = sum(len(r.unmatched) for r in collection_results)
     unmatched_tracks = sum(len(r.unmatched_tracks) for r in playlist_results)
+    unmatched_label_albums = sum(len(r.unmatched) for r in label_results)
     if unmatched_albums:
         log.warning(
-            "%d album(s) could not be matched in Plex — see report above",
+            "%d album(s) could not be matched in Plex (collections) — see report above",
             unmatched_albums,
         )
     if unmatched_tracks:
         log.warning(
             "%d track(s) could not be matched in Plex — see report above",
             unmatched_tracks,
+        )
+    if unmatched_label_albums:
+        log.warning(
+            "%d album(s) could not be matched in Plex (labels) — see report above",
+            unmatched_label_albums,
+        )
+    total_conflicts = sum(len(r.conflicts) for r in label_results)
+    if total_conflicts:
+        log.warning(
+            "%d album(s) appeared in multiple label playlists — see report above",
+            total_conflicts,
         )
 
 

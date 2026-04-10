@@ -18,3 +18,7 @@ sync:
   # Track-level: iTunes playlist -> Plex Playlist (preserves order)
   track_playlists:
     "iTunes Playlist Name": "Plex Playlist Name"
+
+  # Record label: iTunes playlist -> Plex album studio/label field
+  labels:
+    "iTunes Label Playlist": "Record Label Name"

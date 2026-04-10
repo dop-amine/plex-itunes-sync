@@ -31,12 +31,12 @@ itunes:
 
 sync:
   # Album-level: iTunes playlist -> Plex Collection
-  playlists:
+  collections:
     "Dub Sessions": "Dub Sessions"
     # Add more: "iTunes Playlist Name": "Plex Collection Name"
 
   # Track-level: iTunes playlist -> Plex Playlist (preserves order)
-  track_playlists:
+  playlists:
     "My iTunes Playlist": "My Plex Playlist"
 
   # Record label: iTunes playlist -> Plex album studio field
@@ -44,8 +44,8 @@ sync:
     "Stones Throw": "Stones Throw Records"
 ```
 
-- **`sync.playlists`** maps an iTunes playlist to a Plex **Collection**. Albums are deduplicated from the playlist's tracks.
-- **`sync.track_playlists`** maps an iTunes playlist to a Plex **Playlist**. Individual tracks are matched and their order is preserved.
+- **`sync.collections`** maps an iTunes playlist to a Plex **Collection**. Albums are deduplicated from the playlist's tracks.
+- **`sync.playlists`** maps an iTunes playlist to a Plex **Playlist**. Individual tracks are matched and their order is preserved.
 - **`sync.labels`** maps an iTunes playlist to a **record label** name. Each matched album's studio field in Plex is set to that label. If an album appears in multiple label playlists, the first one wins and conflicts are reported.
 
 ### Finding your Plex token
@@ -88,7 +88,7 @@ python sync.py --no-remove
 
 ## How It Works
 
-### Collection sync (`sync.playlists`)
+### Collection sync (`sync.collections`)
 1. Parses `iTunes Library.xml` with Python's `plistlib`
 2. Finds each configured playlist and extracts track references
 3. Groups tracks by (Album Artist, Album Name) to get unique albums
@@ -96,7 +96,7 @@ python sync.py --no-remove
 5. Creates the collection if it doesn't exist, or updates it (adds missing albums, removes stale ones)
 6. Reports matched and unmatched albums
 
-### Playlist sync (`sync.track_playlists`)
+### Playlist sync (`sync.playlists`)
 1. Parses `iTunes Library.xml` the same way
 2. Extracts the ordered list of individual tracks from each playlist
 3. Matches each track to a Plex track by (Artist, Album, Title), falling back to case-insensitive and path-based matching
@@ -180,7 +180,7 @@ All subsequent lookups are O(1) dictionary hits. If all four tiers miss, the scr
 
 ### Plex Track Index
 
-For track-level playlist sync, the same bulk-fetch strategy is used, but for **tracks** instead of albums. This means fetching every track in the library (`/library/sections/{id}/allLeaves`), which can be 100K+ tracks for a large library. The index is only built when `track_playlists` is configured.
+For track-level playlist sync, the same bulk-fetch strategy is used, but for **tracks** instead of albums. This means fetching every track in the library (`/library/sections/{id}/allLeaves`), which can be 100K+ tracks for a large library. The index is only built when `playlists` (track-level) is configured.
 
 Four matching tiers are used:
 

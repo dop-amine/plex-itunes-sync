@@ -12,11 +12,11 @@ itunes:
 
 sync:
   # Album-level: iTunes playlist -> Plex Collection
-  playlists:
+  collections:
     "iTunes Playlist Name": "Plex Collection Name"
 
   # Track-level: iTunes playlist -> Plex Playlist (preserves order)
-  track_playlists:
+  playlists:
     "iTunes Playlist Name": "Plex Playlist Name"
 
   # Record label: iTunes playlist -> Plex album studio/label field

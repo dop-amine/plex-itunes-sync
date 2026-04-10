@@ -512,7 +512,7 @@ class PlexAlbumIndex:
 class PlexTrackIndex:
     """Pre-fetched index of all Plex tracks for fast in-memory matching.
 
-    Only built when ``track_playlists`` is configured.  Fetches every track
+    Only built when ``playlists`` is configured.  Fetches every track
     in the library and builds O(1) lookup dicts keyed by:
 
         1. NFC-normalized  (artist, album, title)
@@ -1166,16 +1166,16 @@ def main() -> None:
     xml_path = cfg["itunes"]["library_xml"]
     itunes_prefix = cfg["path_mapping"]["itunes_prefix"]
     plex_prefix = cfg["path_mapping"]["plex_prefix"]
+    collection_map: dict[str, str] = cfg["sync"].get("collections", {}) or {}
     playlist_map: dict[str, str] = cfg["sync"].get("playlists", {}) or {}
-    track_playlist_map: dict[str, str] = cfg["sync"].get("track_playlists", {}) or {}
     label_map: dict[str, str] = cfg["sync"].get("labels", {}) or {}
 
     if plex_token == "YOUR_PLEX_TOKEN":
         log.error("Please set your Plex token in config.yaml")
         sys.exit(1)
 
-    if not playlist_map and not track_playlist_map and not label_map:
-        log.error("No playlists, track_playlists, or labels configured in sync section")
+    if not collection_map and not playlist_map and not label_map:
+        log.error("No collections, playlists, or labels configured in sync section")
         sys.exit(1)
 
     # Parse iTunes library
@@ -1187,16 +1187,16 @@ def main() -> None:
 
     # Build album index if needed by collections or labels
     album_index: PlexAlbumIndex | None = None
-    if playlist_map or label_map:
+    if collection_map or label_map:
         album_index = PlexAlbumIndex(music)
 
     # --- Collection sync ---
     collection_results: list[SyncResult] = []
 
-    if playlist_map:
+    if collection_map:
         collection_index = PlexCollectionIndex(music)
 
-        for itunes_playlist, collection_name in playlist_map.items():
+        for itunes_playlist, collection_name in collection_map.items():
             log.info(
                 "Syncing playlist '%s' -> collection '%s'",
                 itunes_playlist,
@@ -1228,10 +1228,10 @@ def main() -> None:
     # --- Playlist (track-level) sync ---
     playlist_results: list[PlaylistSyncResult] = []
 
-    if track_playlist_map:
+    if playlist_map:
         track_index = PlexTrackIndex(music)
 
-        for itunes_playlist, plex_playlist_name in track_playlist_map.items():
+        for itunes_playlist, plex_playlist_name in playlist_map.items():
             log.info(
                 "Syncing playlist '%s' -> Plex playlist '%s'",
                 itunes_playlist,

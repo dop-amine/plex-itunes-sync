@@ -86,6 +86,18 @@ python sync.py --config /path/to/config.yaml
 python sync.py --no-remove
 ```
 
+### Clearing unmanaged labels
+
+`clear_labels.py` scans every album in Plex and clears the studio field on any album whose label is **not** in your `sync.labels` config. Useful for cleaning up stale or manually-set labels.
+
+```bash
+# Preview what would be cleared
+python clear_labels.py --dry-run
+
+# Actually clear
+python clear_labels.py
+```
+
 ## How It Works
 
 ### Collection sync (`sync.collections`)
@@ -108,6 +120,13 @@ python sync.py --no-remove
 2. Matches each album to Plex using the same album index
 3. Sets (or overwrites) the album's **studio** field in Plex to the configured label name
 4. Detects albums that appear in multiple label playlists — first label wins, conflicts are reported so you can clean up
+
+### Clear unmanaged labels (`clear_labels.py`)
+1. Loads the set of known label names from `sync.labels` values in `config.yaml`
+2. Fetches every album from Plex in a single bulk API call
+3. For each album with a non-empty studio field, checks if it matches a known label (case-insensitive, Unicode-normalized)
+4. Clears the studio field on any album whose label is not in the managed list
+5. Reports totals: scanned, kept, cleared
 
 ---
 
@@ -256,6 +275,7 @@ The script is intentionally limited in what it can do:
 | Add/remove albums from collections | Yes | Metadata tags, not file operations |
 | Add/remove/reorder tracks in playlists | Yes | Playlist metadata, not file operations |
 | Edit album studio/label field | Yes | Reversible metadata edit via Plex UI |
+| Clear unmanaged studio fields | Yes | `clear_labels.py` — only clears labels not in config |
 | Modify music files | **No** | No file I/O to the music directory |
 | Delete Plex collections or playlists | **No** | Only creates or updates |
 | Modify Plex library settings | **No** | Only collection/playlist/album-level operations |

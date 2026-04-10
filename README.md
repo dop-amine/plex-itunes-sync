@@ -1,8 +1,8 @@
 # iTunes to Plex Sync
 
-Syncs iTunes playlists to Plex **Collections** (album-level) and/or Plex **Playlists** (track-level, preserving order). Reads your `iTunes Library.xml`, finds the matching content in Plex, and creates or updates the targets.
+Syncs iTunes playlists to Plex **Collections** (album-level), **Playlists** (track-level, preserving order), and/or **album labels** (record label / studio metadata). Reads your `iTunes Library.xml`, finds the matching content in Plex, and creates or updates the targets.
 
-**Non-destructive**: only reads the XML file and manages Plex collection/playlist metadata. Music files are never touched.
+**Non-destructive**: only reads the XML file and manages Plex metadata. Music files are never touched.
 
 Tested with iTunes 12.4.0.119 on Windows and Plex Media Server on Ubuntu Linux.
 
@@ -38,10 +38,15 @@ sync:
   # Track-level: iTunes playlist -> Plex Playlist (preserves order)
   track_playlists:
     "My iTunes Playlist": "My Plex Playlist"
+
+  # Record label: iTunes playlist -> Plex album studio field
+  labels:
+    "Stones Throw": "Stones Throw Records"
 ```
 
 - **`sync.playlists`** maps an iTunes playlist to a Plex **Collection**. Albums are deduplicated from the playlist's tracks.
 - **`sync.track_playlists`** maps an iTunes playlist to a Plex **Playlist**. Individual tracks are matched and their order is preserved.
+- **`sync.labels`** maps an iTunes playlist to a **record label** name. Each matched album's studio field in Plex is set to that label. If an album appears in multiple label playlists, the first one wins and conflicts are reported.
 
 ### Finding your Plex token
 
@@ -98,6 +103,12 @@ python sync.py --no-remove
 4. Creates the Plex playlist if it doesn't exist, or updates it (adds missing tracks, removes stale ones, reorders to match iTunes)
 5. Reports matched and unmatched tracks
 
+### Label sync (`sync.labels`)
+1. Extracts albums from each label playlist (same as collection sync)
+2. Matches each album to Plex using the same album index
+3. Sets (or overwrites) the album's **studio** field in Plex to the configured label name
+4. Detects albums that appear in multiple label playlists — first label wins, conflicts are reported so you can clean up
+
 ---
 
 ## Technical Deep Dive
@@ -124,11 +135,12 @@ python sync.py --no-remove
 │  Plex Media Server ◄───┘            │
 │    └─ Music Library                 │
 │         ├─ Collections (created)    │
-│         └─ Playlists (created)      │
+│         ├─ Playlists (created)      │
+│         └─ Album metadata (labels)  │
 └─────────────────────────────────────┘
 ```
 
-The script runs entirely on the Windows side. It reads the local iTunes XML file and talks to Plex over HTTP. Music files on the Plex server are never touched -- only collection and playlist metadata is written through the Plex API.
+The script runs entirely on the Windows side. It reads the local iTunes XML file and talks to Plex over HTTP. Music files on the Plex server are never touched -- only collection, playlist, and album metadata is written through the Plex API.
 
 ### iTunes Library.xml Structure
 
@@ -219,6 +231,17 @@ Track-level playlist sync follows the same idempotent pattern:
    - If all tracks match but **order** differs → reorder to match iTunes
 3. Plex's `moveItem()` API is used to reorder tracks into the correct sequence without removing and re-adding them.
 
+### Label Sync (Idempotent, Conflict-Aware)
+
+Label sync edits the `studio` field on each matched Plex album via `editStudio()`:
+
+1. For each album in the label playlist, check if it was already assigned a label by a previous playlist in this run (first-label-wins).
+2. If the album's current `studio` already matches the target label, skip it (already set).
+3. Otherwise, overwrite the `studio` field.
+4. Albums appearing in multiple label playlists are flagged as conflicts in the report so you can deduplicate in iTunes.
+
+Running twice is a no-op on the second run. The `studio` field can always be manually edited or cleared in Plex's UI.
+
 ### Safety Model
 
 The script is intentionally limited in what it can do:
@@ -232,9 +255,10 @@ The script is intentionally limited in what it can do:
 | Create Plex playlists | Yes | Additive metadata only |
 | Add/remove albums from collections | Yes | Metadata tags, not file operations |
 | Add/remove/reorder tracks in playlists | Yes | Playlist metadata, not file operations |
+| Edit album studio/label field | Yes | Reversible metadata edit via Plex UI |
 | Modify music files | **No** | No file I/O to the music directory |
 | Delete Plex collections or playlists | **No** | Only creates or updates |
-| Modify Plex library settings | **No** | Only collection/playlist-level operations |
+| Modify Plex library settings | **No** | Only collection/playlist/album-level operations |
 
 Deleting a Plex collection or playlist does not affect the underlying albums or tracks in any way -- they are purely organizational metadata.
 

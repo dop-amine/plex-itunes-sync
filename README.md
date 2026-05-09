@@ -46,7 +46,17 @@ sync:
 
 - **`sync.collections`** maps an iTunes playlist to a Plex **Collection**. Albums are deduplicated from the playlist's tracks.
 - **`sync.playlists`** maps an iTunes playlist to a Plex **Playlist**. Individual tracks are matched and their order is preserved.
-- **`sync.labels`** maps an iTunes playlist to a **record label** name. Each matched album's studio field in Plex is set to that label. If an album appears in multiple label playlists, the first one wins and conflicts are reported.
+- **`sync.labels`** maps an iTunes playlist to a **record label** name. Each matched album's studio field in Plex is set to that label. If an album appears in multiple label playlists, the first playlist processed wins unless you override it (see below).
+
+### Multi-label overrides (`label_overrides.yaml`)
+
+When an album appears in more than one label playlist, `sync.py` reports it as a conflict. To pick the winning label without removing albums from iTunes:
+
+1. Place **`label_overrides.yaml`** next to your `config.yaml` (same folder as `--config` points to).
+2. After a sync run that finds conflicts, the script **creates or updates** this file with one entry per conflicting album: `artist`, `album`, `labels` (the competing names), and **`label`** (your choice).
+3. Edit **`label`** to the studio value you want on Plex, save the file, and run `sync.py` again.
+
+The file is gitignored (personal choices). Overrides are matched by artist/album from your YAML and also resolved to Plex rating keys so the same album still respects your choice when iTunes artist text differs between playlists (for example Tom and Jerry vs another credited artist).
 
 ### Finding your Plex token
 
@@ -119,7 +129,8 @@ python clear_labels.py
 1. Extracts albums from each label playlist (same as collection sync)
 2. Matches each album to Plex using the same album index
 3. Sets (or overwrites) the album's **studio** field in Plex to the configured label name
-4. Detects albums that appear in multiple label playlists — first label wins, conflicts are reported so you can clean up
+4. Detects albums that appear in multiple label playlists — default is first-playlist-in-config wins; **`label_overrides.yaml`** can force your preferred label and avoids flipping studio back and forth on every run
+5. Rewrites **`label_overrides.yaml`** when there are conflicts so new overlaps get merged in
 
 ### Clear unmanaged labels (`clear_labels.py`)
 1. Loads the set of known label names from `sync.labels` values in `config.yaml`
@@ -254,12 +265,14 @@ Track-level playlist sync follows the same idempotent pattern:
 
 Label sync edits the `studio` field on each matched Plex album via `editStudio()`:
 
-1. For each album in the label playlist, check if it was already assigned a label by a previous playlist in this run (first-label-wins).
-2. If the album's current `studio` already matches the target label, skip it (already set).
-3. Otherwise, overwrite the `studio` field.
-4. Albums appearing in multiple label playlists are flagged as conflicts in the report so you can deduplicate in iTunes.
+1. Optional **`label_overrides.yaml`** is loaded; overrides are pre-resolved to Plex rating keys so one Plex album is tied to your chosen label even when iTunes metadata differs between playlists.
+2. For each album in each label playlist: if an override says a *different* label should win, that playlist skips writing (defer) until the chosen label’s playlist runs.
+3. If no override applies, the usual rule applies: first label playlist in the run that claims the album wins; later playlists log a conflict unless an override selects them.
+4. If the album's current `studio` already matches the target label, skip it (already set).
+5. Otherwise, overwrite the `studio` field.
+6. Conflicting pairs are listed in the report and merged into **`label_overrides.yaml`** for editing.
 
-Running twice is a no-op on the second run. The `studio` field can always be manually edited or cleared in Plex's UI.
+Running twice is a no-op on the second run once Plex matches iTunes and overrides. The `studio` field can always be manually edited or cleared in Plex's UI.
 
 ### Safety Model
 
@@ -275,6 +288,7 @@ The script is intentionally limited in what it can do:
 | Add/remove albums from collections | Yes | Metadata tags, not file operations |
 | Add/remove/reorder tracks in playlists | Yes | Playlist metadata, not file operations |
 | Edit album studio/label field | Yes | Reversible metadata edit via Plex UI |
+| Write `label_overrides.yaml` | Yes | Local file next to config; gitignored |
 | Clear unmanaged studio fields | Yes | `clear_labels.py` — only clears labels not in config |
 | Modify music files | **No** | No file I/O to the music directory |
 | Delete Plex collections or playlists | **No** | Only creates or updates |

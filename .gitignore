@@ -5,3 +5,4 @@ __pycache__/
 config.yaml
 .itunes_cache_*.pickle
 plex-only-albums.md
+label_overrides.yaml

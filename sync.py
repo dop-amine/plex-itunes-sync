@@ -945,6 +945,112 @@ def _reorder_playlist(plex: PlexServer, playlist_name: str, desired_tracks: list
 
 
 # ---------------------------------------------------------------------------
+# Label override resolution
+# ---------------------------------------------------------------------------
+
+def load_label_overrides(path: str) -> dict[tuple[str, str], str]:
+    """Load label_overrides.yaml and return a dict of (artist, album) -> chosen label."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as e:
+        log.warning("Could not read label overrides: %s", e)
+        return {}
+
+    overrides: dict[tuple[str, str], str] = {}
+    for entry in data.get("overrides", []):
+        artist = entry.get("artist", "")
+        album = entry.get("album", "")
+        label = entry.get("label", "")
+        if artist and album and label:
+            overrides[(_norm_ci(artist), _norm_ci(album))] = label
+    if overrides:
+        log.info("Loaded %d label overrides from %s", len(overrides), path)
+    return overrides
+
+
+def _save_label_overrides(
+    path: str,
+    all_conflicts: list[tuple[AlbumKey, str, str]],
+    existing_overrides: dict[tuple[str, str], str],
+) -> None:
+    """Write label_overrides.yaml, merging new conflicts with existing choices."""
+    p = Path(path)
+
+    existing_entries: dict[tuple[str, str], dict] = {}
+    if p.exists():
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            for entry in data.get("overrides", []):
+                key = (_norm_ci(entry.get("artist", "")), _norm_ci(entry.get("album", "")))
+                existing_entries[key] = entry
+        except Exception:
+            pass
+
+    for ak, first_label, second_label in all_conflicts:
+        key = (_norm_ci(ak.album_artist), _norm_ci(ak.album))
+        if key in existing_entries:
+            entry = existing_entries[key]
+            current_labels = set(entry.get("labels", []))
+            current_labels.add(first_label)
+            current_labels.add(second_label)
+            entry["labels"] = sorted(current_labels)
+        else:
+            chosen = existing_overrides.get(key, first_label)
+            existing_entries[key] = {
+                "artist": ak.album_artist,
+                "album": ak.album,
+                "labels": sorted({first_label, second_label}),
+                "label": chosen,
+            }
+
+    entries = list(existing_entries.values())
+    entries.sort(key=lambda e: (e.get("artist", ""), e.get("album", "")))
+
+    lines = [
+        "# Multi-label conflicts — albums that appear in more than one label playlist.",
+        "# Set \"label\" to the one you want applied. Remove entries to use first-wins default.",
+        "# This file is auto-updated by sync.py when new conflicts are discovered.",
+        "",
+        "overrides:",
+    ]
+    for entry in entries:
+        lines.append(f'  - artist: "{entry["artist"]}"')
+        lines.append(f'    album: "{entry["album"]}"')
+        labels_str = ", ".join(f'"{lb}"' for lb in entry.get("labels", []))
+        lines.append(f"    labels: [{labels_str}]")
+        lines.append(f'    label: "{entry["label"]}"')
+        lines.append("")
+
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    log.info("Updated label overrides: %s (%d entries)", path, len(entries))
+
+
+def _pre_resolve_overrides(
+    label_overrides: dict[tuple[str, str], str],
+    album_index: PlexAlbumIndex,
+    rk_overrides: dict[int, str],
+) -> None:
+    """Map override entries to Plex ratingKeys for cross-name matching."""
+    for (artist_ci, album_ci), chosen_label in label_overrides.items():
+        ak = AlbumKey(album_artist=artist_ci, album=album_ci)
+        hit = album_index.find(ak)
+        if hit:
+            rk_overrides[hit.ratingKey] = chosen_label
+            log.debug(
+                "Pre-resolved override: %s - %s (rk=%s) -> '%s'",
+                hit.parentTitle, hit.title, hit.ratingKey, chosen_label,
+            )
+    if rk_overrides:
+        log.info("Pre-resolved %d overrides to Plex ratingKeys", len(rk_overrides))
+
+
+# ---------------------------------------------------------------------------
 # Label (studio) metadata sync
 # ---------------------------------------------------------------------------
 
@@ -955,15 +1061,22 @@ def sync_label(
     path_map: dict[AlbumKey, list[str]],
     album_index: PlexAlbumIndex,
     seen_albums: dict[int, str],
+    label_overrides: dict[tuple[str, str], str] | None = None,
+    rk_overrides: dict[int, str] | None = None,
     *,
     dry_run: bool = False,
 ) -> LabelSyncResult:
     """Set the studio field on matched Plex albums to the given label.
 
     ``seen_albums`` tracks ratingKey -> first assigned label across all label
-    playlists to detect multi-label conflicts (first label wins).
+    playlists to detect multi-label conflicts.  ``label_overrides`` maps
+    (artist, album) -> chosen label so the user's preferred label always wins.
+    ``rk_overrides`` maps ratingKey -> chosen label, built up as overrides are
+    discovered so that different iTunes names for the same Plex album still defer.
     """
     result = LabelSyncResult(label_name=label_name, itunes_albums=len(albums))
+    overrides = label_overrides or {}
+    rk_map = rk_overrides if rk_overrides is not None else {}
 
     for ak in albums:
         plex_album = album_index.find_with_fallback(
@@ -977,14 +1090,38 @@ def sync_label(
         result.matched += 1
         rk = plex_album.ratingKey
 
+        override_key = (_norm_ci(ak.album_artist), _norm_ci(ak.album))
+        chosen = overrides.get(override_key) or rk_map.get(rk)
+
         if rk in seen_albums:
             prev_label = seen_albums[rk]
             if prev_label != label_name:
                 result.conflicts.append((ak, prev_label, label_name))
-                log.warning(
-                    "CONFLICT: %s already assigned to '%s', skipping '%s'",
-                    ak, prev_label, label_name,
-                )
+                if chosen and _norm_ci(chosen) == _norm_ci(label_name):
+                    log.info(
+                        "OVERRIDE: %s — switching from '%s' to '%s'",
+                        ak, prev_label, label_name,
+                    )
+                    seen_albums[rk] = label_name
+                else:
+                    log.warning(
+                        "CONFLICT: %s already assigned to '%s', skipping '%s'",
+                        ak, prev_label, label_name,
+                    )
+                    continue
+            else:
+                continue
+
+        # If an override exists for this album pointing to a different label,
+        # record it in seen_albums (so the conflict triggers later) but skip
+        # writing to Plex — let the overridden label do the actual write.
+        if chosen and _norm_ci(chosen) != _norm_ci(label_name):
+            seen_albums[rk] = label_name
+            rk_map[rk] = chosen
+            log.debug(
+                "Deferring %s — override wants '%s', not '%s'",
+                ak, chosen, label_name,
+            )
             continue
 
         seen_albums[rk] = label_name
@@ -1263,6 +1400,15 @@ def main() -> None:
         assert album_index is not None
         seen_albums: dict[int, str] = {}
 
+        overrides_path = str(Path(args.config).parent / "label_overrides.yaml")
+        label_overrides = load_label_overrides(overrides_path)
+        rk_overrides: dict[int, str] = {}
+
+        # Pre-resolve overrides to ratingKeys so that albums with different
+        # iTunes names (e.g. "Tom and Jerry" vs "Rahaan") still get deferred.
+        if label_overrides:
+            _pre_resolve_overrides(label_overrides, album_index, rk_overrides)
+
         for itunes_playlist, label_name in label_map.items():
             log.info(
                 "Syncing playlist '%s' -> label '%s'",
@@ -1285,9 +1431,15 @@ def main() -> None:
                 path_map,
                 album_index,
                 seen_albums,
+                label_overrides,
+                rk_overrides,
                 dry_run=args.dry_run,
             )
             label_results.append(lr)
+
+        all_conflicts = [c for r in label_results for c in r.conflicts]
+        if all_conflicts:
+            _save_label_overrides(overrides_path, all_conflicts, label_overrides)
 
     # --- Report ---
     print_report(collection_results, playlist_results, label_results)

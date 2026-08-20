@@ -1,0 +1,16 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: plex-itunes-sync
+  title: Plex iTunes Sync
+  description: >-
+    Reads an iTunes Library.xml and mirrors its playlists into Plex as
+    collections, ordered playlists and album labels. Non-destructive — it
+    reads the XML and writes only Plex metadata, never touching a music file.
+  annotations:
+    github.com/project-slug: dop-amine/plex-itunes-sync
+    dop-amine.com/tier: '3'
+spec:
+  type: worker
+  lifecycle: production
+  owner: dop-amine

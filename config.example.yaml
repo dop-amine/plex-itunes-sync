@@ -13,7 +13,17 @@ itunes:
 sync:
   # Album-level: iTunes playlist -> Plex Collection
   collections:
+    # One-way (default): iTunes is authoritative. Albums in the Plex
+    # collection but not the iTunes playlist are removed from Plex.
     "iTunes Playlist Name": "Plex Collection Name"
+
+    # Two-way: an album added to the collection *in Plex* is imported back
+    # into the iTunes playlist instead of being deleted as stale. Requires
+    # iTunes (COM) and the itunes-automation package. Removals from the
+    # iTunes side additionally need --allow-itunes-removals.
+    "Another iTunes Playlist":
+      target: "Another Plex Collection"
+      direction: two-way        # or: itunes-to-plex (default)
 
   # Track-level: iTunes playlist -> Plex Playlist (preserves order)
   playlists:

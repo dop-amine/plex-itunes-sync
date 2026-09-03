@@ -1,2 +1,7 @@
 plexapi
 pyyaml
+
+# Optional. Progress bars during the long index builds; progress.py degrades to
+# plain start/end log lines when it is missing, and nothing in that layer may
+# change what the sync does. See README, "Progress Reporting".
+rich

@@ -51,19 +51,48 @@ the collection — before treating it as a Plex-side deletion.
 ## Album match overrides
 
 `album_overrides.yaml` is auto-seeded with `suggested:` lines whenever an
-album's files are found in Plex under a different album name. Confirm the real
-matches by copying the suggestion into `plex_album`. Outstanding as of the last
-run:
+album's files are found in Plex under a different album name. A suggestion is
+a hint from file paths, not a verdict — it only takes effect once its name is
+copied into `plex_album`.
 
-- Fine Feline — The 9 Lives EP → `The 9 Lives LP`
-- Hyper-On Experience — Lords Of The Null Lines (The Extremely Bootlegged Remixes) → `(Bootleg Mixes)`
-- Unknown Error — Heaven and Hell → `Heaven And Hell EP (MSXEP042) WEB`
-- Rob Dougan — Clubbed To Death (Compact Disc Experience → `Clubbed To Death #2`
-- DJ Monk & Top Cat — Love Me Sess → `DJ Monk & Top Cat - Love Me Se`
-- Gramatik — The Age Of Reason → `The Age Of Reason Instrumentals` — **do not
-  confirm this one**; Plex has mis-grouped the vocal album's tracks into the
-  instrumentals album. Fix the ID3 album tags on the 15 files in
-  `Gramatik/The Age Of Reason/` and let Plex regroup instead.
+**Confirmed** (verified as one release that iTunes tagged with two names; the
+iTunes files are exactly the Plex album's files, or the two iTunes names hold
+complementary tracks):
+
+- DJ Monk & Top Cat — Love Me Sess → `DJ Monk & Top Cat - Love Me Se` (1:1 file
+  match; Plex simply truncated the name)
+- Unknown Error — Heaven and Hell → `Heaven And Hell EP (MSXEP042) WEB` (4:4)
+- Hyper-On Experience — Lords Of The Null Lines (The Extremely Bootlegged
+  Remixes) → `Lords Of The Null Lines (Bootleg Mixes)` (complementary titles;
+  the other 2 files carry a different Album Artist tag)
+
+**Deliberately not confirmed** — in each case Plex has merged two separate
+releases into one album, so pinning the override would cement a grouping error
+instead of fixing it. Correct the ID3 album tags at the source and let Plex
+regroup:
+
+- Gramatik — The Age Of Reason → suggests `The Age Of Reason Instrumentals`.
+  The vocal album's 15 tracks are grouped into the 3-track instrumentals album.
+  Fix the tags on the 15 files in `D:\Music\iTunes\iTunes Media\Music\Gramatik\The Age Of Reason\`.
+- Fine Feline — The 9 Lives EP → suggests `The 9 Lives LP`. Separate releases:
+  the EP's 3 tracks and the LP's 6 are distinct files, overlapping on *Just For
+  U* and *Weekend* (and `1 Blood` vs `One Blood`). 3 files in
+  `...\Music\Fine Feline\The 9 Lives EP\`.
+- Rob Dougan — Clubbed To Death (Compact Disc Experience → suggests
+  `Clubbed To Death #2`. Separate releases sharing 3 remix titles. Note the
+  **folder name is itself truncated** —
+  `...\Music\Rob Dougan\Clubbed To Death (Compact Disc Experienc` — which is
+  the root cause: the truncated album tag gave Plex nothing to group on, so it
+  folded the 6 files into `Clubbed To Death #2`. Fix the folder and tag.
+
+### How to tell the two cases apart
+
+The useful test is whether the two iTunes album names hold **complementary** or
+**overlapping** track titles. Complementary means one release that got split
+across two tags — safe to confirm. Overlapping titles mean two real releases
+that Plex merged — fix the tags instead. File-set comparison alone is not
+enough: every one of these has its iTunes files present in the suggested Plex
+album, which is exactly why the suggestion was generated.
 
 ## Further speed work
 

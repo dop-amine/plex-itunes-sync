@@ -6,3 +6,5 @@ config.yaml
 .itunes_cache_*.pickle
 plex-only-albums.md
 label_overrides.yaml
+.sync_state.json
+album_overrides.yaml

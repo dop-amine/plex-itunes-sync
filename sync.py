@@ -22,7 +22,15 @@ from plexapi.collection import Collection
 from plexapi.playlist import Playlist
 from plexapi.server import PlexServer
 
+import progress
+from sync_state import SyncState, next_state, three_way_merge
+
 log = logging.getLogger("itunes-plex-sync")
+
+# Sync directions for an entry under `sync.collections`.
+DIR_TO_PLEX = "itunes-to-plex"
+DIR_TWO_WAY = "two-way"
+_DIRECTIONS = {DIR_TO_PLEX, DIR_TWO_WAY}
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +52,18 @@ def _norm(s: str) -> str:
 def _norm_ci(s: str) -> str:
     """NFC-normalize, collapse whitespace, and casefold."""
     return _norm(s).casefold()
+
+
+# Punctuation-insensitive comparison, used *only* to sanity-check a path-based
+# match.  Keeps letters and digits of any script (so CJK titles don't collapse
+# to an empty string) and drops spacing, dashes, and punctuation, which is
+# where iTunes and Plex most often disagree without meaning a different album.
+_PUNCT = re.compile(r"[\W_]+", re.UNICODE)
+
+
+def _norm_loose(s: str) -> str:
+    """NFC + casefold + strip punctuation/whitespace entirely."""
+    return _PUNCT.sub("", _norm_ci(s))
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +90,18 @@ class SyncResult:
     added: list[object] = field(default_factory=list)
     removed: list[object] = field(default_factory=list)
     already_present: list[object] = field(default_factory=list)
+    # Two-way only: albums pushed back into / dropped from the iTunes playlist.
+    itunes_added: list[object] = field(default_factory=list)
+    itunes_removed: list[object] = field(default_factory=list)
+    itunes_skipped: list[object] = field(default_factory=list)
+    direction: str = "itunes-to-plex"
+
+
+@dataclass
+class ITunesContext:
+    """Everything needed to write back to iTunes: a COM handle and an album index."""
+    itunes: object
+    album_index: object
 
 
 @dataclass(frozen=True)
@@ -349,6 +381,13 @@ def connect_plex(url: str, token: str) -> PlexServer:
     return PlexServer(url, token)
 
 
+# Leading track number on a filename stem: "01 Brave Men", "1-04_Torture".
+_TRACK_NO_PREFIX = re.compile(r"^\s*\d{1,3}(?:[-.]\d{1,3})?[\s._-]+")
+
+# How many of an album's files to try before giving up on the path fallback.
+_PATH_FALLBACK_MAX_FILES = 5
+
+
 class PlexAlbumIndex:
     """Pre-fetched index of all Plex albums for fast in-memory matching.
 
@@ -371,13 +410,25 @@ class PlexAlbumIndex:
         self._by_at_ci: dict[tuple[str, str], list] = {}
         self._by_t_ci: dict[str, list] = {}
         self._all_albums: list = []
+        # (artist_ci, album_ci) -> (plex artist, plex album) pins from
+        # album_overrides.yaml, and the diagnoses we collect to seed that file.
+        self._overrides: dict[tuple[str, str], tuple[str, str]] = {}
+        self._suggestions: dict[tuple[str, str], tuple[AlbumKey, str, str]] = {}
         self._build()
+
+    def set_overrides(self, overrides: dict[tuple[str, str], tuple[str, str]]) -> None:
+        self._overrides = overrides
+
+    @property
+    def suggestions(self) -> list[tuple[AlbumKey, str, str]]:
+        """Albums whose files were found in Plex under a different album name."""
+        return list(self._suggestions.values())
 
     def _build(self) -> None:
         t0 = time.perf_counter()
         log.info("Fetching all albums from Plex ...")
         key = f"/library/sections/{self._section.key}/albums"
-        self._all_albums = self._section.fetchItems(key, container_size=1000)
+        self._all_albums = _fetch_paged(self._section, key, "Albums", 9)
         elapsed = time.perf_counter() - t0
         log.info("Fetched %d albums in %.1fs", len(self._all_albums), elapsed)
 
@@ -394,6 +445,13 @@ class PlexAlbumIndex:
             self._by_t.setdefault(k_t, []).append(album)
             self._by_at_ci.setdefault(k_at_ci, []).append(album)
             self._by_t_ci.setdefault(k_t_ci, []).append(album)
+
+    # NOTE: inverting each album's Collection tags into collection membership
+    # looks like it should remove the one-HTTP-call-per-collection cost, but
+    # Plex's bulk album listing under-reports those tags — measured at 40 of 61
+    # collections short, and `includeCollections=1` returns nothing at all (and
+    # takes 7 minutes). There is no cheap bulk source for membership; use
+    # `collection.items()`.
 
     @staticmethod
     def _pick(candidates: list, artist_hint: str = "") -> object | None:
@@ -462,6 +520,24 @@ class PlexAlbumIndex:
         plex_paths: list[str] | None = None,
     ) -> object | None:
         """Try index match, then fall back to a targeted Plex API search."""
+        # An explicit pin from album_overrides.yaml beats every heuristic.
+        pin = self._overrides.get(
+            (_norm_ci(album_key.album_artist), _norm_ci(album_key.album))
+        )
+        if pin:
+            pin_artist, pin_album = pin
+            hit = self.find(AlbumKey(
+                album_artist=pin_artist or album_key.album_artist,
+                album=pin_album,
+            ))
+            if hit:
+                log.debug("Override match: %s -> %s", album_key, hit.title)
+                return hit
+            log.warning(
+                "Album override for %s points at '%s — %s', which is not in Plex",
+                album_key, pin_artist, pin_album,
+            )
+
         result = self.find(album_key)
         if result:
             return result
@@ -487,20 +563,56 @@ class PlexAlbumIndex:
         except Exception:
             pass
 
-        # Path-based last resort
+        # Path-based last resort.  Two things this has to get right:
+        # Plex track titles don't carry the leading track number that the
+        # filename does ("01 Brave Men.mp3" -> "Brave Men"), so search for both
+        # forms; and one unreadable filename shouldn't sink the whole album, so
+        # try several files instead of only the first.
         if plex_paths:
             log.debug("Trying path-based match for %s", album_key)
-            for plex_path in plex_paths:
-                try:
-                    fname = PurePosixPath(plex_path).stem
-                    results = music_section.searchTracks(title=fname)
+            for plex_path in plex_paths[:_PATH_FALLBACK_MAX_FILES]:
+                stem = PurePosixPath(plex_path).stem
+                candidates = [stem]
+                stripped = _TRACK_NO_PREFIX.sub("", stem).strip()
+                if stripped and stripped != stem:
+                    candidates.append(stripped)
+
+                for candidate in candidates:
+                    try:
+                        results = music_section.searchTracks(title=candidate)
+                    except Exception:
+                        log.debug("Path-based search failed for %s", plex_path)
+                        continue
+
                     for track in results:
-                        for loc in track.locations:
-                            if loc == plex_path:
-                                return track.album()
-                except Exception:
-                    log.debug("Path-based search failed for %s", plex_path)
-                break
+                        for loc in (getattr(track, "locations", None) or []):
+                            if loc != plex_path:
+                                continue
+                            album = track.album()
+                            wanted = _norm_loose(album_key.album)
+                            got = _norm_loose(album.title or "")
+                            if wanted and got and wanted == got:
+                                log.debug(
+                                    "Path match: %s -> %s (via %s)",
+                                    album_key, album.title, plex_path,
+                                )
+                                return album
+                            # The file is in Plex, but Plex files it under a
+                            # *different* album — mis-grouped tags, not a
+                            # rename.  Syncing that album would quietly put the
+                            # wrong record in the collection (and stamp the
+                            # wrong label on it), so refuse and say why.
+                            log.warning(
+                                "PATH MATCH REJECTED: %s -> Plex album '%s — %s' "
+                                "(file %s). Pin it in album_overrides.yaml if "
+                                "they are the same record.",
+                                album_key, album.parentTitle, album.title, plex_path,
+                            )
+                            self._suggestions[
+                                (_norm_ci(album_key.album_artist),
+                                 _norm_ci(album_key.album))
+                            ] = (album_key, album.parentTitle or "", album.title or "")
+                            return None
 
         return None
 
@@ -534,7 +646,7 @@ class PlexTrackIndex:
         t0 = time.perf_counter()
         log.info("Fetching all tracks from Plex (this may take a few minutes) ...")
         key = f"/library/sections/{self._section.key}/allLeaves"
-        all_tracks = self._section.fetchItems(key, container_size=1000)
+        all_tracks = _fetch_paged(self._section, key, "Tracks", 10)
         elapsed = time.perf_counter() - t0
         log.info("Fetched %d tracks in %.1fs", len(all_tracks), elapsed)
 
@@ -661,6 +773,53 @@ class PlexCollectionIndex:
 
 _ADD_BATCH_SIZE = 20
 
+# Items per request when paging the big library listings.
+_FETCH_PAGE_SIZE = 1000
+
+
+def _fetch_paged(section, key: str, label: str, libtype: int) -> list:
+    """Fetch a whole library listing in pages so progress can be shown.
+
+    plexapi would happily fetch this in one call, but that is a multi-minute
+    silence with nothing on screen.  Paging costs nothing extra and gives a
+    real bar with an ETA.
+    """
+    total = None
+    try:
+        total = section.totalViewSize(libtype=libtype)
+    except Exception:
+        log.debug("Could not get total size for %s — progress will be indeterminate", label)
+
+    out: list = []
+    start = 0
+    with progress.reporter.task(label, total=total) as task:
+        while True:
+            batch = section.fetchItems(
+                key,
+                container_start=start,
+                container_size=_FETCH_PAGE_SIZE,
+                maxresults=_FETCH_PAGE_SIZE,
+            )
+            if not batch:
+                break
+            out.extend(batch)
+            start += len(batch)
+            task.advance(len(batch))
+            if len(batch) < _FETCH_PAGE_SIZE:
+                break
+            if total is not None and start >= total:
+                break
+    return out
+
+
+def _delete_quietly(target, kind: str, name: str) -> None:
+    """Delete an empty collection/playlist shell, tolerating it already being gone."""
+    try:
+        target.delete()
+    except Exception as e:
+        log.debug("Could not delete empty %s '%s' (%s) — recreating anyway",
+                  kind, name, e)
+
 
 def _batched_add(collection, items: list) -> None:
     """Add items to a collection in batches to avoid URI-too-long errors."""
@@ -685,11 +844,22 @@ def sync_collection(
     *,
     dry_run: bool = False,
     no_remove: bool = False,
+    direction: str = DIR_TO_PLEX,
+    state: SyncState | None = None,
+    itunes_ctx: "ITunesContext | None" = None,
+    itunes_playlist_name: str = "",
+    allow_itunes_removals: bool = False,
 ) -> SyncResult:
-    """Create or update a Plex collection to match the given album list."""
+    """Create or update a Plex collection to match the given album list.
+
+    With ``direction`` set to ``two-way`` and an ``itunes_ctx`` supplied, albums
+    added on the *Plex* side are pushed back into the iTunes playlist instead of
+    being deleted as stale — see ``sync_state.three_way_merge``.
+    """
     result = SyncResult(
         collection_name=collection_name,
         itunes_albums=list(albums),
+        direction=direction,
     )
 
     # --- Match iTunes albums to Plex album objects ---
@@ -714,26 +884,43 @@ def sync_collection(
 
     # --- Find or create the collection ---
     existing = collection_index.find(collection_name)
+    current_albums = list(existing.items()) if existing is not None else []
+
+    two_way = direction == DIR_TWO_WAY and itunes_ctx is not None
+    # A collection that is missing from Plex is not evidence that every album
+    # was deleted there — a rename or a hand-deleted collection looks identical.
+    # Treat it as a first run so two-way sync can never mass-remove from iTunes
+    # on the strength of an absent collection.
+    first_run = (
+        state is None
+        or not state.has_target(collection_name)
+        or existing is None
+    )
+    if two_way and first_run and state is not None and existing is not None:
+        log.info(
+            "No sync state for '%s' yet — this run records state; iTunes wins",
+            collection_name,
+        )
+
+    plan = three_way_merge(
+        plex_albums,
+        current_albums,
+        state.get(collection_name) if state is not None else set(),
+        first_run=first_run,
+        two_way=two_way,
+        no_remove=no_remove,
+    )
 
     if existing is not None:
         log.info(
             "Found existing collection '%s' (ratingKey=%s)",
             existing.title, existing.ratingKey,
         )
-        existing_keys = {item.ratingKey for item in existing.items()}
-        desired_keys = {a.ratingKey for a in plex_albums}
+        existing_keys = {item.ratingKey for item in current_albums}
 
-        to_add = [a for a in plex_albums if a.ratingKey not in existing_keys]
-        to_remove = (
-            []
-            if no_remove
-            else [
-                item
-                for item in existing.items()
-                if item.ratingKey not in desired_keys
-            ]
-        )
-        already = [a for a in plex_albums if a.ratingKey in existing_keys]
+        to_add = plan.add_to_plex
+        to_remove = plan.remove_from_plex
+        already = plan.already_in_sync
 
         result.added = to_add
         result.removed = to_remove
@@ -750,7 +937,7 @@ def sync_collection(
                     # Plex rejects addItems on empty collections; recreate
                     # with items instead (the old empty shell is replaced).
                     log.debug("Collection is empty — recreating with items")
-                    existing.delete()
+                    _delete_quietly(existing, "collection", collection_name)
                     Collection.create(
                         plex, collection_name, music_section, items=to_add
                     )
@@ -783,7 +970,98 @@ def sync_collection(
                 len(plex_albums),
             )
 
+    # --- iTunes side (two-way only) ---
+    if two_way:
+        _apply_itunes_side(
+            plan,
+            result,
+            itunes_ctx,
+            itunes_playlist_name,
+            dry_run=dry_run,
+            allow_itunes_removals=allow_itunes_removals,
+        )
+
+    # --- Record what both sides look like once the plan has been applied ---
+    if state is not None and not dry_run:
+        rks = next_state(plan, plex_albums, current_albums)
+        names = {
+            a.ratingKey: (a.parentTitle or "", a.title or "")
+            for a in list(plex_albums) + list(current_albums)
+        }
+        state.set(collection_name, rks, names)
+
     return result
+
+
+def _apply_itunes_side(
+    plan,
+    result: SyncResult,
+    itunes_ctx: "ITunesContext",
+    itunes_playlist_name: str,
+    *,
+    dry_run: bool,
+    allow_itunes_removals: bool,
+) -> None:
+    """Push Plex-side additions back into iTunes (and removals, if allowed)."""
+    import itunes_bridge
+
+    if not plan.add_to_itunes and not plan.remove_from_itunes:
+        return
+
+    playlist = None
+    if plan.add_to_itunes:
+        playlist = itunes_bridge.find_or_create_playlist(
+            itunes_ctx.itunes, itunes_playlist_name, dry_run=dry_run,
+        )
+        if playlist is None and not dry_run:
+            log.error(
+                "Could not find or create iTunes playlist '%s' — skipping %d import(s)",
+                itunes_playlist_name, len(plan.add_to_itunes),
+            )
+            return
+
+        for album in plan.add_to_itunes:
+            artist = album.parentTitle or ""
+            title = album.title or ""
+            n = itunes_bridge.add_album(
+                itunes_ctx.itunes, playlist, itunes_ctx.album_index,
+                artist, title, dry_run=dry_run,
+            )
+            if n:
+                result.itunes_added.append(album)
+            else:
+                result.itunes_skipped.append(album)
+
+    if plan.remove_from_itunes:
+        if not allow_itunes_removals:
+            # Deleting playlist entries in iTunes is the one irreversible thing
+            # this tool can do, so it stays opt-in.  Report and move on.
+            for album in plan.remove_from_itunes:
+                log.warning(
+                    "WOULD REMOVE FROM ITUNES (needs --allow-itunes-removals): %s — %s",
+                    album.parentTitle, album.title,
+                )
+            result.itunes_skipped.extend(plan.remove_from_itunes)
+            return
+
+        if playlist is None:
+            playlist = itunes_bridge.find_playlist(
+                itunes_ctx.itunes, itunes_playlist_name,
+            )
+        if playlist is None:
+            log.error(
+                "iTunes playlist '%s' not found — skipping %d removal(s)",
+                itunes_playlist_name, len(plan.remove_from_itunes),
+            )
+            return
+
+        for album in plan.remove_from_itunes:
+            n = itunes_bridge.remove_album(
+                playlist, album.parentTitle or "", album.title or "",
+                dry_run=dry_run,
+            )
+            if n:
+                result.itunes_removed.append(album)
 
 
 # ---------------------------------------------------------------------------
@@ -881,7 +1159,9 @@ def sync_playlist(
             if to_add:
                 if not existing_key_set or (not existing_key_set - {t.ratingKey for t in to_remove}):
                     log.debug("Playlist is/will be empty — recreating with items")
-                    existing.delete()
+                    # Plex may have auto-removed the playlist the moment the
+                    # last track left it, so the delete can legitimately 404.
+                    _delete_quietly(existing, "playlist", playlist_name)
                     Playlist.create(
                         plex, playlist_name, section=music_section, items=plex_tracks
                     )
@@ -920,11 +1200,24 @@ def _reorder_playlist(plex: PlexServer, playlist_name: str, desired_tracks: list
     Plex's ``move`` API moves a track before/after another using ratingKeys.
     We walk the desired order and move each track into position.
     """
+    # Use the same tolerant lookup as sync_playlist: plex.playlist() goes
+    # through Plex's search API, which is unreliable for names with unusual
+    # characters — and a miss here fails *silently*, leaving a stale order.
+    pl = _find_plex_playlist(plex, playlist_name)
+    if pl is None:
+        log.warning(
+            "Could not reload playlist '%s' to reorder — order left unchanged",
+            playlist_name,
+        )
+        return
+
     try:
-        pl = plex.playlist(playlist_name)
         current = pl.items()
     except Exception:
-        log.debug("Could not reload playlist for reorder — skipping")
+        log.warning(
+            "Could not read items of playlist '%s' to reorder — order left unchanged",
+            playlist_name,
+        )
         return
 
     current_keys = [t.ratingKey for t in current]
@@ -948,8 +1241,107 @@ def _reorder_playlist(plex: PlexServer, playlist_name: str, desired_tracks: list
 # Label override resolution
 # ---------------------------------------------------------------------------
 
-def load_label_overrides(path: str) -> dict[tuple[str, str], str]:
-    """Load label_overrides.yaml and return a dict of (artist, album) -> chosen label."""
+def load_album_overrides(path: str) -> dict[tuple[str, str], tuple[str, str]]:
+    """Load album_overrides.yaml: (iTunes artist, album) -> (Plex artist, album).
+
+    Only entries with a non-empty ``plex_album`` are applied.  Entries written
+    automatically carry a ``suggested:`` line and an empty ``plex_album``, so a
+    machine-generated guess never takes effect until it has been confirmed.
+    """
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as e:
+        log.warning("Could not read album overrides: %s", e)
+        return {}
+
+    out: dict[tuple[str, str], tuple[str, str]] = {}
+    for entry in data.get("overrides", []) or []:
+        artist = entry.get("artist", "") or ""
+        album = entry.get("album", "") or ""
+        plex_album = entry.get("plex_album", "") or ""
+        plex_artist = entry.get("plex_artist", "") or ""
+        if artist and album and plex_album:
+            out[(_norm_ci(artist), _norm_ci(album))] = (plex_artist, plex_album)
+    if out:
+        log.info("Loaded %d album override(s) from %s", len(out), path)
+    return out
+
+
+def _save_album_overrides(
+    path: str,
+    suggestions: list[tuple[AlbumKey, str, str]],
+) -> None:
+    """Merge newly diagnosed mismatches into album_overrides.yaml as suggestions."""
+    p = Path(path)
+    entries: dict[tuple[str, str], dict] = {}
+
+    if p.exists():
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            for entry in data.get("overrides", []) or []:
+                key = (_norm_ci(entry.get("artist", "") or ""),
+                       _norm_ci(entry.get("album", "") or ""))
+                entries[key] = entry
+        except Exception:
+            log.warning("Could not read existing album overrides — rewriting")
+
+    added = 0
+    for ak, plex_artist, plex_album in suggestions:
+        key = (_norm_ci(ak.album_artist), _norm_ci(ak.album))
+        if key in entries:
+            entries[key]["suggested"] = f"{plex_artist} — {plex_album}"
+            continue
+        entries[key] = {
+            "artist": ak.album_artist,
+            "album": ak.album,
+            "suggested": f"{plex_artist} — {plex_album}",
+            "plex_artist": "",
+            "plex_album": "",
+        }
+        added += 1
+
+    rows = sorted(entries.values(), key=lambda e: (e.get("artist", ""), e.get("album", "")))
+    lines = [
+        "# Album match overrides — iTunes albums that did not match in Plex.",
+        "#",
+        "# 'suggested' is where the album's files actually live in Plex, found by",
+        "# path. It is a hint only. To apply it, copy the album name into",
+        "# 'plex_album' (and 'plex_artist' if the artist differs too). Entries with",
+        "# an empty 'plex_album' are ignored.",
+        "#",
+        "# This file is auto-updated by sync.py; your edits are preserved.",
+        "",
+        "overrides:",
+    ]
+    for e in rows:
+        lines.append(f'  - artist: "{e.get("artist", "")}"')
+        lines.append(f'    album: "{e.get("album", "")}"')
+        if e.get("suggested"):
+            lines.append(f'    suggested: "{e["suggested"]}"')
+        lines.append(f'    plex_artist: "{e.get("plex_artist", "") or ""}"')
+        lines.append(f'    plex_album: "{e.get("plex_album", "") or ""}"')
+        lines.append("")
+
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    log.info("Updated album overrides: %s (%d entries, %d new)", path, len(rows), added)
+
+
+def load_label_overrides(
+    path: str,
+    names_out: dict[tuple[str, str], tuple[str, str]] | None = None,
+) -> dict[tuple[str, str], str]:
+    """Load label_overrides.yaml and return a dict of (artist, album) -> chosen label.
+
+    Keys are casefolded for lookup.  ``names_out``, when given, is filled with
+    the same keys mapped to the *original-case* (artist, album) so callers that
+    need to match against Plex can do so through the strict index tiers.
+    """
     p = Path(path)
     if not p.exists():
         return {}
@@ -966,7 +1358,10 @@ def load_label_overrides(path: str) -> dict[tuple[str, str], str]:
         album = entry.get("album", "")
         label = entry.get("label", "")
         if artist and album and label:
-            overrides[(_norm_ci(artist), _norm_ci(album))] = label
+            key = (_norm_ci(artist), _norm_ci(album))
+            overrides[key] = label
+            if names_out is not None:
+                names_out[key] = (artist, album)
     if overrides:
         log.info("Loaded %d label overrides from %s", len(overrides), path)
     return overrides
@@ -1035,10 +1430,19 @@ def _pre_resolve_overrides(
     label_overrides: dict[tuple[str, str], str],
     album_index: PlexAlbumIndex,
     rk_overrides: dict[int, str],
+    override_names: dict[tuple[str, str], tuple[str, str]] | None = None,
 ) -> None:
-    """Map override entries to Plex ratingKeys for cross-name matching."""
-    for (artist_ci, album_ci), chosen_label in label_overrides.items():
-        ak = AlbumKey(album_artist=artist_ci, album=album_ci)
+    """Map override entries to Plex ratingKeys for cross-name matching.
+
+    Looks the album up under its *original* casing where available: index tiers
+    1 and 2 compare case-sensitively, so feeding them casefolded text silently
+    forces every override through the loosest title-only tiers — the ones most
+    likely to land on the wrong album.
+    """
+    names = override_names or {}
+    for key, chosen_label in label_overrides.items():
+        artist, album = names.get(key, key)
+        ak = AlbumKey(album_artist=artist, album=album)
         hit = album_index.find(ak)
         if hit:
             rk_overrides[hit.ratingKey] = chosen_label
@@ -1183,6 +1587,18 @@ def print_report(
             print(f"  Removed:         {len(r.removed)}")
             print(f"  Already present: {len(r.already_present)}")
 
+            if r.direction == DIR_TWO_WAY:
+                print(f"  -> iTunes added:    {len(r.itunes_added)}")
+                print(f"  -> iTunes removed:  {len(r.itunes_removed)}")
+                if r.itunes_skipped:
+                    print(f"  -> iTunes skipped:  {len(r.itunes_skipped)}")
+                for a in r.itunes_added:
+                    print(f"       + {a.parentTitle} — {a.title}")
+                for a in r.itunes_removed:
+                    print(f"       - {a.parentTitle} — {a.title}")
+                for a in r.itunes_skipped:
+                    print(f"       ! {a.parentTitle} — {a.title}")
+
             if r.unmatched:
                 print("\n  Unmatched albums:")
                 for ak in r.unmatched:
@@ -1263,11 +1679,92 @@ def parse_args() -> argparse.Namespace:
         help="Don't remove items from existing collections/playlists",
     )
     parser.add_argument(
+        "--allow-itunes-removals",
+        action="store_true",
+        help=(
+            "For two-way collections, also remove tracks from the iTunes "
+            "playlist when their album is removed from the Plex collection. "
+            "Off by default: this is the only irreversible write this tool makes."
+        ),
+    )
+    parser.add_argument(
+        "--only",
+        default="",
+        help=(
+            "Comma-separated passes to run: collections, playlists, labels. "
+            "Skipping 'playlists' avoids building the track index, which is "
+            "~100s of the run."
+        ),
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress bars (they are off automatically when not a TTY)",
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable debug-level logging",
     )
     return parser.parse_args()
+
+
+def parse_target(value: object, itunes_playlist: str) -> tuple[str, str]:
+    """Normalize a `sync.collections` value into (plex target name, direction).
+
+    Accepts the original plain-string form as well as a mapping::
+
+        "My Playlist": "My Collection"                          # one-way
+        "My Playlist": {target: "My Collection", direction: two-way}
+    """
+    if isinstance(value, str):
+        return value, DIR_TO_PLEX
+    if isinstance(value, dict):
+        target = value.get("target") or value.get("collection") or ""
+        direction = (value.get("direction") or DIR_TO_PLEX).strip()
+        if not target:
+            log.error(
+                "Entry for iTunes playlist '%s' has no 'target' — skipping",
+                itunes_playlist,
+            )
+            return "", DIR_TO_PLEX
+        if direction not in _DIRECTIONS:
+            log.error(
+                "Unknown direction %r for '%s' (expected one of %s) — using %s",
+                direction, itunes_playlist, sorted(_DIRECTIONS), DIR_TO_PLEX,
+            )
+            direction = DIR_TO_PLEX
+        return target, direction
+    log.error("Unsupported entry for iTunes playlist '%s': %r", itunes_playlist, value)
+    return "", DIR_TO_PLEX
+
+
+def _connect_itunes(library: dict, two_way_targets: list[str]) -> "ITunesContext | None":
+    """Connect to iTunes and index it, or return None and fall back to one-way."""
+    try:
+        import itunes_bridge
+    except Exception as e:
+        log.error(
+            "Two-way sync configured for %d playlist(s) but itunes_bridge is "
+            "unavailable (%s) — falling back to one-way for this run",
+            len(two_way_targets), e,
+        )
+        return None
+
+    try:
+        itunes = itunes_bridge.connect()
+    except itunes_bridge.ITunesBridgeError as e:
+        log.error(
+            "Two-way sync configured for %d playlist(s) but iTunes is not "
+            "reachable (%s) — falling back to one-way for this run",
+            len(two_way_targets), e,
+        )
+        return None
+
+    return ITunesContext(
+        itunes=itunes,
+        album_index=itunes_bridge.ITunesAlbumIndex(library),
+    )
 
 
 def load_config(path: str) -> dict:
@@ -1295,6 +1792,8 @@ def main() -> None:
         handlers=[logging.StreamHandler(sys.stdout)],
     )
 
+    progress.configure(enabled=not args.no_progress and not args.verbose)
+
     cfg = load_config(args.config)
 
     plex_url = cfg["plex"]["url"]
@@ -1306,6 +1805,25 @@ def main() -> None:
     collection_map: dict[str, str] = cfg["sync"].get("collections", {}) or {}
     playlist_map: dict[str, str] = cfg["sync"].get("playlists", {}) or {}
     label_map: dict[str, str] = cfg["sync"].get("labels", {}) or {}
+
+    all_passes = {"collections", "playlists", "labels"}
+    if args.only:
+        passes = {p.strip().lower() for p in args.only.split(",") if p.strip()}
+        unknown = passes - all_passes
+        if unknown:
+            log.error("Unknown pass(es) %s — expected any of %s",
+                      sorted(unknown), sorted(all_passes))
+            sys.exit(1)
+        log.info("Running only: %s", ", ".join(sorted(passes)))
+    else:
+        passes = all_passes
+
+    if "collections" not in passes:
+        collection_map = {}
+    if "playlists" not in passes:
+        playlist_map = {}
+    if "labels" not in passes:
+        label_map = {}
 
     if plex_token == "YOUR_PLEX_TOKEN":
         log.error("Please set your Plex token in config.yaml")
@@ -1322,10 +1840,14 @@ def main() -> None:
     plex = connect_plex(plex_url, plex_token)
     music = plex.library.section(library_name)
 
+    progress.reporter.start()
+
     # Build album index if needed by collections or labels
     album_index: PlexAlbumIndex | None = None
+    album_overrides_path = str(Path(args.config).parent / "album_overrides.yaml")
     if collection_map or label_map:
         album_index = PlexAlbumIndex(music)
+        album_index.set_overrides(load_album_overrides(album_overrides_path))
 
     # --- Collection sync ---
     collection_results: list[SyncResult] = []
@@ -1333,11 +1855,32 @@ def main() -> None:
     if collection_map:
         collection_index = PlexCollectionIndex(music)
 
-        for itunes_playlist, collection_name in collection_map.items():
+        targets = {
+            pl: parse_target(val, pl) for pl, val in collection_map.items()
+        }
+        two_way_targets = [
+            pl for pl, (name, d) in targets.items() if name and d == DIR_TWO_WAY
+        ]
+
+        state: SyncState | None = None
+        itunes_ctx: ITunesContext | None = None
+        if two_way_targets:
+            state = SyncState(Path(args.config).parent / ".sync_state.json")
+            state.load()
+            itunes_ctx = _connect_itunes(library, two_way_targets)
+
+        n_targets = sum(1 for name, _ in targets.values() if name)
+        for i, (itunes_playlist, (collection_name, direction)) in enumerate(
+            targets.items(), 1
+        ):
+            if not collection_name:
+                continue
             log.info(
-                "Syncing playlist '%s' -> collection '%s'",
+                "[%d/%d] Syncing playlist '%s' -> collection '%s' (%s)",
+                i, n_targets,
                 itunes_playlist,
                 collection_name,
+                direction,
             )
 
             albums = extract_playlist_albums(library, itunes_playlist)
@@ -1359,8 +1902,19 @@ def main() -> None:
                 collection_index,
                 dry_run=args.dry_run,
                 no_remove=args.no_remove,
+                direction=direction if itunes_ctx is not None else DIR_TO_PLEX,
+                state=state,
+                itunes_ctx=itunes_ctx,
+                itunes_playlist_name=itunes_playlist,
+                allow_itunes_removals=args.allow_itunes_removals,
             )
             collection_results.append(sr)
+
+        if state is not None:
+            if args.dry_run:
+                log.info("[DRY RUN] Sync state not written")
+            else:
+                state.save()
 
     # --- Playlist (track-level) sync ---
     playlist_results: list[PlaylistSyncResult] = []
@@ -1368,9 +1922,12 @@ def main() -> None:
     if playlist_map:
         track_index = PlexTrackIndex(music)
 
-        for itunes_playlist, plex_playlist_name in playlist_map.items():
+        for i, (itunes_playlist, plex_playlist_name) in enumerate(
+            playlist_map.items(), 1
+        ):
             log.info(
-                "Syncing playlist '%s' -> Plex playlist '%s'",
+                "[%d/%d] Syncing playlist '%s' -> Plex playlist '%s'",
+                i, len(playlist_map),
                 itunes_playlist,
                 plex_playlist_name,
             )
@@ -1401,18 +1958,21 @@ def main() -> None:
         seen_albums: dict[int, str] = {}
 
         overrides_path = str(Path(args.config).parent / "label_overrides.yaml")
-        label_overrides = load_label_overrides(overrides_path)
+        override_names: dict[tuple[str, str], tuple[str, str]] = {}
+        label_overrides = load_label_overrides(overrides_path, override_names)
         rk_overrides: dict[int, str] = {}
 
         # Pre-resolve overrides to ratingKeys so that albums with different
         # iTunes names (e.g. "Tom and Jerry" vs "Rahaan") still get deferred.
         if label_overrides:
-            _pre_resolve_overrides(label_overrides, album_index, rk_overrides)
+            _pre_resolve_overrides(
+                label_overrides, album_index, rk_overrides, override_names,
+            )
 
-        for itunes_playlist, label_name in label_map.items():
+        for i, (itunes_playlist, label_name) in enumerate(label_map.items(), 1):
             log.info(
-                "Syncing playlist '%s' -> label '%s'",
-                itunes_playlist, label_name,
+                "[%d/%d] Syncing playlist '%s' -> label '%s'",
+                i, len(label_map), itunes_playlist, label_name,
             )
 
             albums = extract_playlist_albums(library, itunes_playlist)
@@ -1439,9 +1999,26 @@ def main() -> None:
 
         all_conflicts = [c for r in label_results for c in r.conflicts]
         if all_conflicts:
-            _save_label_overrides(overrides_path, all_conflicts, label_overrides)
+            if args.dry_run:
+                log.info(
+                    "[DRY RUN] Would update %s with %d conflicting album(s)",
+                    overrides_path, len(all_conflicts),
+                )
+            else:
+                _save_label_overrides(overrides_path, all_conflicts, label_overrides)
+
+    # --- Album match suggestions ---
+    if album_index is not None and album_index.suggestions:
+        if args.dry_run:
+            log.info(
+                "[DRY RUN] Would record %d album match suggestion(s) in %s",
+                len(album_index.suggestions), album_overrides_path,
+            )
+        else:
+            _save_album_overrides(album_overrides_path, album_index.suggestions)
 
     # --- Report ---
+    progress.reporter.stop()
     print_report(collection_results, playlist_results, label_results)
 
     unmatched_albums = sum(len(r.unmatched) for r in collection_results)

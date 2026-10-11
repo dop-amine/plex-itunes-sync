@@ -114,21 +114,29 @@ would additionally break iTunes' `Location` pointers for those 6 tracks, making
 them show as missing. And neither fixes the mismatch: Plex would still call the
 album `Clubbed To Death #2`.
 
-### What is actually left to choose
+### Resolved, 2026-10-11
 
-1. **Accept it.** Three albums stay out of their targets: Fine Feline from
-   `>$100 Records`, Gramatik from `dopamine's personal collage` and the
-   `Lowtemp Music` label, Rob Dougan from the `Mo Wax` label.
-2. **Pin the overrides after all.** Plex will not split these, so the merged
-   album is simply where those files live. Confirming the three suggestions in
-   `album_overrides.yaml` gets the albums into their collections and labels. The
-   cost is cosmetic and per-album: `dopamine's personal collage` would show an
-   album titled `The Age Of Reason Instrumentals`, which is the worst of the
-   three; `The 9 Lives LP` and `Clubbed To Death #2` are mild. Reversible by
-   clearing `plex_album`.
-3. **Rebuild the grouping the hard way** — move a folder out of the library,
-   rescan so Plex drops the album, move it back, rescan again. Untested here,
-   heavy, and it would churn the Syncthing replica.
+Since Plex will not split these, the merged album is simply where the files
+live, and the question became whether each album is worth having under a
+slightly wrong title.
+
+- **Fine Feline — The 9 Lives EP → `The 9 Lives LP`: pinned and applied.**
+  `>$100 Records` went from 356 to 357 albums, 0 unmatched, 0 removed, and a
+  second dry run is a clean no-op. The collection now carries the 9-track
+  merged album instead of nothing; it is the right record either way.
+- **Gramatik — The Age Of Reason: deliberately left unpinned.** Pinning would
+  put an album titled `The Age Of Reason Instrumentals` into
+  `dopamine's personal collage`, a hand-curated collection, which is not worth
+  the correct label that comes with it. Revisit only if Plex ever splits it.
+- **Rob Dougan: nothing to do.** The merged album already carries
+  `studio = 'Mo Wax'`, so the label this album was wanted for is applied. Its
+  absence from the label playlist's matches costs nothing. The truncated
+  `TALB` and folder name remain a cosmetic defect — see above for why fixing
+  them is more entangled than it looks, and note it would not change matching.
+
+Net effect: 1 of the 3 recovered, 1 declined on taste, 1 that never needed
+fixing. The remaining unmatched count is 3 lines (Gramatik twice, Rob Dougan
+once) and that is the steady state, not a backlog.
 
 ### How to tell the two cases apart
 

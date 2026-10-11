@@ -100,6 +100,20 @@ a path-based lookup using `path_mapping` to translate an iTunes `Location` URL i
   delete the empty shell and recreate it with items. Don't "simplify" that away.
 - Reordering uses `moveItem(track, after=previous)` walking the desired order, rather than
   remove-and-re-add.
+- **The bulk listings are guarded for completeness.** `_fetch_paged` compares what came back
+  against `_endpoint_total` and raises `PartialIndexError` on a shortfall; `main` aborts with
+  exit 1. This is fatal by design: an album missing from the index is indistinguishable from
+  an album missing from the library, so a partial listing drops that album from the desired
+  set and the copy already in the Plex collection reads as stale and gets removed. A
+  background Plex scan could otherwise empty a collection on an ordinary run. `--no-remove`
+  is the escape hatch if a sync has to happen mid-scan.
+- `_endpoint_total` queries the *same* endpoint being paged, not
+  `section.totalViewSize(libtype=...)`. Those disagree: `/albums` reports 17370 where
+  `/all?type=9` (what `totalViewSize` hits) reports 17369, so a guard built on the latter
+  would need a fudge factor and fire on every run. Compare an endpoint against itself.
+- `_fetch_paged` deliberately has no `start >= total` early break. When the count lags the
+  real size, that break truncates the fetch into exactly the partial listing the guard
+  exists to catch. A short or empty batch is the only termination condition.
 
 ### Label conflicts and `label_overrides.yaml`
 

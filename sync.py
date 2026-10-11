@@ -15,9 +15,11 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import NoReturn
 from urllib.parse import unquote
 
 import yaml
+from plexapi import utils as plex_utils
 from plexapi.collection import Collection
 from plexapi.playlist import Playlist
 from plexapi.server import PlexServer
@@ -428,7 +430,7 @@ class PlexAlbumIndex:
         t0 = time.perf_counter()
         log.info("Fetching all albums from Plex ...")
         key = f"/library/sections/{self._section.key}/albums"
-        self._all_albums = _fetch_paged(self._section, key, "Albums", 9)
+        self._all_albums = _fetch_paged(self._section, key, "Albums")
         elapsed = time.perf_counter() - t0
         log.info("Fetched %d albums in %.1fs", len(self._all_albums), elapsed)
 
@@ -646,7 +648,7 @@ class PlexTrackIndex:
         t0 = time.perf_counter()
         log.info("Fetching all tracks from Plex (this may take a few minutes) ...")
         key = f"/library/sections/{self._section.key}/allLeaves"
-        all_tracks = _fetch_paged(self._section, key, "Tracks", 10)
+        all_tracks = _fetch_paged(self._section, key, "Tracks")
         elapsed = time.perf_counter() - t0
         log.info("Fetched %d tracks in %.1fs", len(all_tracks), elapsed)
 
@@ -777,22 +779,52 @@ _ADD_BATCH_SIZE = 20
 _FETCH_PAGE_SIZE = 1000
 
 
-def _fetch_paged(section, key: str, label: str, libtype: int) -> list:
+class PartialIndexError(RuntimeError):
+    """A bulk library listing came back short of what Plex said it holds.
+
+    Always fatal.  An album missing from the index is indistinguishable from
+    an album missing from the library, so a partial listing does not merely
+    under-report: every iTunes album it hides drops out of the desired set,
+    and the matching album already in the Plex collection then reads as stale
+    and gets removed.  A background Plex scan could therefore empty a
+    collection on an otherwise ordinary run.
+    """
+
+
+def _endpoint_total(section, key: str) -> int | None:
+    """Ask the endpoint we are about to page how many items it holds.
+
+    Deliberately not ``section.totalViewSize(libtype=...)``: that queries
+    ``/all?type=N``, a different endpoint that disagrees with this one.
+    Measured on this library: ``/albums`` reports 17370 where
+    ``/all?type=9`` reports 17369, and the paged fetch returns 17370.  A
+    guard built on the other endpoint's count would need a fudge factor to
+    avoid firing on every run; comparing an endpoint against itself is exact.
+    """
+    args = {"X-Plex-Container-Start": 0, "X-Plex-Container-Size": 0}
+    try:
+        data = section._server.query(f"{key}{plex_utils.joinArgs(args)}")
+        return plex_utils.cast(int, data.attrib.get("totalSize"))
+    except Exception as e:
+        log.debug("Could not get total size for %s (%s)", key, e)
+        return None
+
+
+def _fetch_paged(section, key: str, label: str) -> list:
     """Fetch a whole library listing in pages so progress can be shown.
 
     plexapi would happily fetch this in one call, but that is a multi-minute
     silence with nothing on screen.  Paging costs nothing extra and gives a
     real bar with an ETA.
+
+    Raises PartialIndexError if fewer items come back than the endpoint
+    claims to hold.
     """
-    total = None
-    try:
-        total = section.totalViewSize(libtype=libtype)
-    except Exception:
-        log.debug("Could not get total size for %s — progress will be indeterminate", label)
+    expected = _endpoint_total(section, key)
 
     out: list = []
     start = 0
-    with progress.reporter.task(label, total=total) as task:
+    with progress.reporter.task(label, total=expected) as task:
         while True:
             batch = section.fetchItems(
                 key,
@@ -807,9 +839,27 @@ def _fetch_paged(section, key: str, label: str, libtype: int) -> list:
             task.advance(len(batch))
             if len(batch) < _FETCH_PAGE_SIZE:
                 break
-            if total is not None and start >= total:
-                break
+            # No early break on `start >= expected`: when the count lags the
+            # real size it would truncate the fetch into exactly the partial
+            # listing this guard exists to catch.  A short or empty batch is
+            # the only termination condition.
+    if expected is not None and len(out) < expected:
+        raise PartialIndexError(
+            f"Plex returned {len(out)} of {expected} {label.lower()} from {key} — "
+            f"{expected - len(out)} missing. Refusing to sync against a partial "
+            f"library view: albums it hides would look stale and be removed from "
+            f"their collections. This usually means a Plex scan or metadata "
+            f"refresh is in progress — re-run once it finishes. If you must sync "
+            f"now, --no-remove makes a partial listing harmless."
+        )
     return out
+
+
+def _abort_partial(e: PartialIndexError) -> NoReturn:
+    """Stop the progress reporter and exit — a partial index is never usable."""
+    progress.reporter.stop()
+    log.error("%s", e)
+    sys.exit(1)
 
 
 def _delete_quietly(target, kind: str, name: str) -> None:
@@ -1846,7 +1896,10 @@ def main() -> None:
     album_index: PlexAlbumIndex | None = None
     album_overrides_path = str(Path(args.config).parent / "album_overrides.yaml")
     if collection_map or label_map:
-        album_index = PlexAlbumIndex(music)
+        try:
+            album_index = PlexAlbumIndex(music)
+        except PartialIndexError as e:
+            _abort_partial(e)
         album_index.set_overrides(load_album_overrides(album_overrides_path))
 
     # --- Collection sync ---
@@ -1920,7 +1973,10 @@ def main() -> None:
     playlist_results: list[PlaylistSyncResult] = []
 
     if playlist_map:
-        track_index = PlexTrackIndex(music)
+        try:
+            track_index = PlexTrackIndex(music)
+        except PartialIndexError as e:
+            _abort_partial(e)
 
         for i, (itunes_playlist, plex_playlist_name) in enumerate(
             playlist_map.items(), 1

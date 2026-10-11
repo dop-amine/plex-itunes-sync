@@ -38,10 +38,14 @@ old for the `dataclasses` this code uses. Windows Python resolves the `/mnt/c` c
 Runs are slow: a dry run with `sync.playlists` configured builds the full track index
 (`/allLeaves`, 100K+ tracks) and takes minutes — use a long timeout or run it in the background.
 
-There is no test suite. `--dry-run` is the verification mechanism: every *Plex* write path
+`--dry-run` is the verification mechanism: every *Plex* write path
 (`Collection.create`, `addItems`/`removeItems`, `moveItem`, `editStudio`) is guarded by it, so a
 dry run exercises all parsing, matching, and diff logic without touching Plex. Keep it that way when
 adding write operations.
+
+There is no general test suite. The one exception is `python.exe test_guard.py` (2-3 min, needs a
+reachable Plex), which covers the partial-index guard below — a dry run cannot exercise it, because
+the failure it prevents only appears while Plex is mid-scan.
 
 One local write is **not** guarded: `main()` calls `_save_label_overrides` whenever any conflicts
 were found, outside any `dry_run` check, so `--dry-run` still rewrites `label_overrides.yaml`.
@@ -108,9 +112,11 @@ a path-based lookup using `path_mapping` to translate an iTunes `Location` URL i
   background Plex scan could otherwise empty a collection on an ordinary run. `--no-remove`
   is the escape hatch if a sync has to happen mid-scan.
 - `_endpoint_total` queries the *same* endpoint being paged, not
-  `section.totalViewSize(libtype=...)`. Those disagree: `/albums` reports 17370 where
-  `/all?type=9` (what `totalViewSize` hits) reports 17369, so a guard built on the latter
-  would need a fudge factor and fire on every run. Compare an endpoint against itself.
+  `section.totalViewSize(libtype=...)`. Those disagree: `/albums` reports 17370 and a full
+  fetch returns exactly 17370, while `/all?type=9` (what `totalViewSize` hits) reports 17369.
+  Swapping it in would leave the guard lenient by one in the wrong direction, so a one-album
+  shortfall would pass undetected — it would *not* fire spuriously, which makes the mistake
+  invisible without a test. Compare an endpoint against itself; `test_guard.py` pins it.
 - `_fetch_paged` deliberately has no `start >= total` early break. When the count lags the
   real size, that break truncates the fetch into exactly the partial listing the guard
   exists to catch. A short or empty batch is the only termination condition.

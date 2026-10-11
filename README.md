@@ -274,7 +274,9 @@ All subsequent lookups are O(1) dictionary hits. If all four tiers miss, the scr
 
 **The bulk fetch is checked for completeness**, and a short one is fatal. This matters more than it sounds: an album missing from the index is indistinguishable from an album missing from the library, so a partial listing doesn't merely under-report — every iTunes album it hides drops out of the desired set, and the copy already sitting in the Plex collection then reads as stale and gets removed. A background Plex scan could empty a collection on an otherwise ordinary run. `_fetch_paged` therefore compares the fetched count against the endpoint's own `totalSize` and raises `PartialIndexError`; the run aborts before any diff is computed. If you have to sync while a scan is running, `--no-remove` makes a partial listing harmless.
 
-The comparison deliberately uses the *same* endpoint being paged rather than `totalViewSize`, because the two disagree: `/albums` reports 17370 albums on this library where `/all?type=9` reports 17369. Comparing an endpoint against itself is exact and needs no tolerance.
+The comparison deliberately uses the *same* endpoint being paged rather than `totalViewSize`, because the two disagree: `/albums` reports 17370 albums on this library and a full paged fetch returns exactly 17370, while `/all?type=9` reports 17369. Using the other count would leave the guard lenient by one in the wrong direction, letting a one-album shortfall through undetected. Comparing an endpoint against itself is exact and needs no tolerance.
+
+`test_guard.py` covers all of this (`python.exe test_guard.py`, 2-3 minutes, needs a reachable Plex). It is the repo's only test, because a dry run cannot reach a failure that only happens while Plex is mid-scan.
 
 ### Plex Track Index
 

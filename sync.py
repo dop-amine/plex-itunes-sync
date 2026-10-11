@@ -796,10 +796,11 @@ def _endpoint_total(section, key: str) -> int | None:
 
     Deliberately not ``section.totalViewSize(libtype=...)``: that queries
     ``/all?type=N``, a different endpoint that disagrees with this one.
-    Measured on this library: ``/albums`` reports 17370 where
-    ``/all?type=9`` reports 17369, and the paged fetch returns 17370.  A
-    guard built on the other endpoint's count would need a fudge factor to
-    avoid firing on every run; comparing an endpoint against itself is exact.
+    Measured on this library: ``/albums`` reports 17370 and a full paged
+    fetch returns exactly 17370, while ``/all?type=9`` reports 17369.
+    Swapping in the other count would leave the guard lenient by one in
+    the wrong direction -- a one-album shortfall would pass undetected.
+    Comparing an endpoint against itself is exact; test_guard.py pins it.
     """
     args = {"X-Plex-Container-Start": 0, "X-Plex-Container-Size": 0}
     try:

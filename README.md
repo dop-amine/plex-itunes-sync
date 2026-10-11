@@ -272,6 +272,10 @@ Instead, the script fetches **every album** in the Plex music library in a singl
 
 All subsequent lookups are O(1) dictionary hits. If all four tiers miss, the script falls back to a targeted Plex API search (Plex's own search is accent-insensitive), and finally to file path matching as a last resort.
 
+**The bulk fetch is checked for completeness**, and a short one is fatal. This matters more than it sounds: an album missing from the index is indistinguishable from an album missing from the library, so a partial listing doesn't merely under-report — every iTunes album it hides drops out of the desired set, and the copy already sitting in the Plex collection then reads as stale and gets removed. A background Plex scan could empty a collection on an otherwise ordinary run. `_fetch_paged` therefore compares the fetched count against the endpoint's own `totalSize` and raises `PartialIndexError`; the run aborts before any diff is computed. If you have to sync while a scan is running, `--no-remove` makes a partial listing harmless.
+
+The comparison deliberately uses the *same* endpoint being paged rather than `totalViewSize`, because the two disagree: `/albums` reports 17370 albums on this library where `/all?type=9` reports 17369. Comparing an endpoint against itself is exact and needs no tolerance.
+
 ### Plex Track Index
 
 For track-level playlist sync, the same bulk-fetch strategy is used, but for **tracks** instead of albums. This means fetching every track in the library (`/library/sections/{id}/allLeaves`), which can be 100K+ tracks for a large library. The index is only built when `playlists` (track-level) is configured.
@@ -389,6 +393,7 @@ The script is intentionally limited in what it can do:
 | Remove tracks from an iTunes playlist | Opt-in | Requires `--allow-itunes-removals`; the only irreversible write |
 | Delete tracks from the iTunes library | **No** | Only playlist `Tracks` are enumerated; non-user playlists are refused |
 | Clear unmanaged studio fields | Yes | `clear_labels.py` — only clears labels not in config |
+| Sync against a partial library listing | **No** | A short bulk fetch raises `PartialIndexError` and aborts |
 | Modify music files | **No** | No file I/O to the music directory |
 | Delete Plex collections or playlists | **No** | Only creates or updates |
 | Modify Plex library settings | **No** | Only collection/playlist/album-level operations |

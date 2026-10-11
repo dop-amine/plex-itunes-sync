@@ -67,23 +67,68 @@ complementary tracks):
   the other 2 files carry a different Album Artist tag)
 
 **Deliberately not confirmed** — in each case Plex has merged two separate
-releases into one album, so pinning the override would cement a grouping error
-instead of fixing it. Correct the ID3 album tags at the source and let Plex
-regroup:
+releases into one album, so pinning the override would cement a grouping error.
 
-- Gramatik — The Age Of Reason → suggests `The Age Of Reason Instrumentals`.
-  The vocal album's 15 tracks are grouped into the 3-track instrumentals album.
-  Fix the tags on the 15 files in `D:\Music\iTunes\iTunes Media\Music\Gramatik\The Age Of Reason\`.
-- Fine Feline — The 9 Lives EP → suggests `The 9 Lives LP`. Separate releases:
-  the EP's 3 tracks and the LP's 6 are distinct files, overlapping on *Just For
-  U* and *Weekend* (and `1 Blood` vs `One Blood`). 3 files in
-  `...\Music\Fine Feline\The 9 Lives EP\`.
+- Gramatik — The Age Of Reason → suggests `The Age Of Reason Instrumentals`
+- Fine Feline — The 9 Lives EP → suggests `The 9 Lives LP`
 - Rob Dougan — Clubbed To Death (Compact Disc Experience → suggests
-  `Clubbed To Death #2`. Separate releases sharing 3 remix titles. Note the
-  **folder name is itself truncated** —
-  `...\Music\Rob Dougan\Clubbed To Death (Compact Disc Experienc` — which is
-  the root cause: the truncated album tag gave Plex nothing to group on, so it
-  folded the 6 files into `Clubbed To Death #2`. Fix the folder and tag.
+  `Clubbed To Death #2`
+
+### The cause is a Plex agent match, and there is no cheap fix
+
+An earlier version of this file said to fix the ID3 album tags and let Plex
+regroup. **That was wrong on both counts: the tags are already correct, and
+nothing self-resolves.**
+
+| Album | Files | `TALB` on disk |
+|---|---|---|
+| Gramatik — The Age Of Reason | 15 | `The Age Of Reason` ✓ |
+| Fine Feline — The 9 Lives EP | 3 | `The 9 Lives EP` ✓ |
+| Rob Dougan | 6 | `Clubbed To Death (Compact Disc Experience` ✗ truncated |
+
+Each merged Plex album draws from **two different folders** and carried a
+`plex://album/...` guid, so its title came from Plex's music agent matching
+both folders to one canonical release — not from `TALB`. The correct album
+title does not exist in Plex for any of the three.
+
+**Unmatching does not split them — tested.** On 2026-10-11 the Fine Feline
+album (ratingKey 344392) was unmatched via plexapi and refreshed. The guid
+dropped to `tv.plex.agents.none://344392`, but after 120s it was still one
+album of 9 tracks across both folders, still titled `The 9 Lives LP`. Plex's
+track-to-album grouping is already in its database and is not re-derived from
+tags on a refresh or an unmatch. Don't spend time on this route again.
+
+That experiment also could not be fully undone: the original
+`plex://album/65d5bf6b0d83c0e15e38e476` is no longer offered as a match
+candidate under the `tv.plex.agents.music` agent (7 candidates, all `mbid://`).
+The album now sits on `mbid://58cbf22e-c687-4803-97a3-d7187d6ea65e` with the
+same title, 9 tracks, year and artwork, and a scoped dry run of
+`>$100 Records` afterwards was unchanged (356 matched, 1 unmatched, 0 removed).
+Equivalent in every way that matters here, but not byte-identical to before.
+
+**Fixing Rob Dougan's truncation is cosmetic, and more entangled than it
+looks.** Editing `TALB` on disk does not update iTunes, which keeps album names
+in its own library database — so the two sides would diverge until the album is
+also set through iTunes COM (`itunes_bridge` can do this). Renaming the folder
+would additionally break iTunes' `Location` pointers for those 6 tracks, making
+them show as missing. And neither fixes the mismatch: Plex would still call the
+album `Clubbed To Death #2`.
+
+### What is actually left to choose
+
+1. **Accept it.** Three albums stay out of their targets: Fine Feline from
+   `>$100 Records`, Gramatik from `dopamine's personal collage` and the
+   `Lowtemp Music` label, Rob Dougan from the `Mo Wax` label.
+2. **Pin the overrides after all.** Plex will not split these, so the merged
+   album is simply where those files live. Confirming the three suggestions in
+   `album_overrides.yaml` gets the albums into their collections and labels. The
+   cost is cosmetic and per-album: `dopamine's personal collage` would show an
+   album titled `The Age Of Reason Instrumentals`, which is the worst of the
+   three; `The 9 Lives LP` and `Clubbed To Death #2` are mild. Reversible by
+   clearing `plex_album`.
+3. **Rebuild the grouping the hard way** — move a folder out of the library,
+   rescan so Plex drops the album, move it back, rescan again. Untested here,
+   heavy, and it would churn the Syncthing replica.
 
 ### How to tell the two cases apart
 
